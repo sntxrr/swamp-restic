@@ -105,10 +105,11 @@ the backup side to distro packages is fine — constraining the validator is not
 
 ## Status
 
-`@sntxrr/restic-repository` is **live-verified** against a real repository: 54
-unit tests plus 20 mechanical checks, quality 14/14, every guard mutation-tested,
-adversarial review gate clean. The fleet workflow and the `readiness` findings
-report are designed (PRD §8–9) and not yet built.
+`@sntxrr/restic-repository` is **published** at `2026.08.07.1` (quality A, 100%,
+repository verified) and **live-verified** against a real repository: 60 unit
+tests plus 22 mechanical checks, every guard mutation-tested, adversarial review
+gate clean. The fleet workflow and the `readiness` findings report are designed
+(PRD §8–9) and not yet built.
 
 ## License
 
