@@ -254,11 +254,37 @@ export function classifyFailure(result: ResticResult): string {
   return "error";
 }
 
-/** Make a string safe for use as a swamp instance name. */
+/** FNV-1a, rendered as 8 hex chars. Not a cryptographic hash. */
+export function shortHash(input: string): string {
+  let h = 0x811c9dc5;
+  for (let i = 0; i < input.length; i++) {
+    h ^= input.charCodeAt(i);
+    h = Math.imul(h, 0x01000193) >>> 0;
+  }
+  return h.toString(16).padStart(8, "0");
+}
+
+/**
+ * Make a string safe for use as a swamp instance name.
+ *
+ * When the value has to be truncated, a hash of the FULL input is appended.
+ * Truncating alone maps two distinct inputs that share a prefix onto one
+ * instance name, and instance names share a flat namespace on disk, so the
+ * second write silently clobbers the first — one repository's validation
+ * status would then masquerade as another's, which is precisely the false
+ * reassurance this suite exists to eliminate. B2 bucket names run to 50
+ * characters, so the 48-character cut is reachable with no exotic input at
+ * all. Same defect, same fix as `@sntxrr/b2/transfer`'s `unfinishedInstanceName`.
+ *
+ * Values short enough not to be truncated are returned unchanged, so the
+ * ordinary case keeps its readable name.
+ */
 export function safeFragment(value: string, max = 48): string {
   const cleaned = value.toLowerCase().replace(/[^a-z0-9-]+/g, "-")
     .replace(/^-+|-+$/g, "");
-  return cleaned.length > max ? cleaned.slice(0, max) : cleaned;
+  if (cleaned.length <= max) return cleaned;
+  const suffix = `-${shortHash(value)}`;
+  return cleaned.slice(0, max - suffix.length).replace(/-+$/, "") + suffix;
 }
 
 /**

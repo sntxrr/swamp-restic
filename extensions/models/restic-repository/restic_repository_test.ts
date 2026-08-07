@@ -393,6 +393,32 @@ Deno.test("safeFragment strips characters unsafe in an instance name", () => {
   assertEquals(safeFragment("a".repeat(80)).length, 48);
 });
 
+Deno.test("safeFragment keeps a short name readable and unhashed", () => {
+  // The ordinary case must not change: every existing instance is named after
+  // a bucket well under the cap, and renaming one is a data migration.
+  assertEquals(safeFragment("heron-debian"), "heron-debian");
+  assertEquals(safeFragment("a".repeat(48)), "a".repeat(48));
+});
+
+Deno.test("safeFragment cannot collide two names sharing a long prefix", () => {
+  // B2 bucket names run to 50 characters, so the 48-character cut is reachable
+  // without exotic input. Truncation alone maps both of these onto one
+  // instance name, and instance names share a flat namespace on disk — the
+  // second scan would silently clobber the first, and one repository's
+  // validation status would then be reported as another's.
+  const a = safeFragment("backup-" + "x".repeat(40) + "-alpha");
+  const b = safeFragment("backup-" + "x".repeat(40) + "-bravo");
+  assert(a !== b, "two distinct repository names collapsed to one instance");
+  assertEquals(a.length, 48);
+  assertEquals(b.length, 48);
+});
+
+Deno.test("repositoryName disambiguates two long-tailed repository URLs", () => {
+  const a = repositoryName("s3:s3.example.invalid/" + "b".repeat(49) + "1");
+  const b = repositoryName("s3:s3.example.invalid/" + "b".repeat(49) + "2");
+  assert(a !== b, "two repositories would share one instance name");
+});
+
 // ---------------------------------------------------------------------------
 // scan
 // ---------------------------------------------------------------------------
