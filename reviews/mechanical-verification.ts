@@ -309,6 +309,58 @@ Deno.test("MECH#4 every validation schema field is written by a rung", async () 
   }
 });
 
+Deno.test("MECH#4 every maintenance schema field is written by unlock", async () => {
+  const fake = await fakeRestic(`echo "successfully removed 2 locks"; exit 0`);
+  try {
+    const h = makeContext({ ...CREDS, resticBinary: fake.path });
+    // deno-lint-ignore no-explicit-any
+    const unlock = (model.methods as any).unlock;
+    await unlock.execute(
+      unlock.arguments.parse({ allowUnlock: true }),
+      h.context,
+    );
+    const rec = h.written.find((w) => w.spec === "maintenance");
+    assert(rec, "unlock wrote no maintenance resource");
+    // deno-lint-ignore no-explicit-any
+    const fields = Object.keys(
+      (model.resources as any).maintenance.schema.shape,
+    );
+    const missing = fields.filter((f) => !(f in rec.data));
+    assertEquals(missing, [], `maintenance fields never written: ${missing}`);
+    const extra = Object.keys(rec.data).filter((f) => !fields.includes(f));
+    assertEquals(extra, [], `written fields absent from schema: ${extra}`);
+  } finally {
+    fake.cleanup();
+  }
+});
+
+Deno.test("MECH#4 an unreported lock count stays null, never collapses to zero", async () => {
+  // Live-verified on restic 0.19.1: with nothing to remove, unlock exits 0 and
+  // prints nothing at all. A helper of the shape `x ?? 0` here would assert a
+  // number restic never gave — the same three-states-into-two defect as
+  // legalHoldOnCount and enable_api_keys.
+  const fake = await fakeRestic("exit 0");
+  try {
+    const h = makeContext({ ...CREDS, resticBinary: fake.path });
+    // deno-lint-ignore no-explicit-any
+    const unlock = (model.methods as any).unlock;
+    await unlock.execute(
+      unlock.arguments.parse({ allowUnlock: true }),
+      h.context,
+    );
+    const rec = h.written.find((w) => w.spec === "maintenance");
+    assert(rec);
+    assertEquals(
+      rec.data.locksRemoved,
+      null,
+      "an absent count became a number",
+    );
+    assertEquals(rec.data.countReported, false);
+  } finally {
+    fake.cleanup();
+  }
+});
+
 // ---------------------------------------------------------------------------
 // #5 Secret hygiene — argv, resources, logs
 // ---------------------------------------------------------------------------

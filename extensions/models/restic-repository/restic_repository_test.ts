@@ -13,6 +13,7 @@ import {
   missingPaths,
   model,
   parseJsonLines,
+  parseLocksRemoved,
   redactSecrets,
   repositoryName,
   RESTIC_EXIT,
@@ -916,10 +917,91 @@ Deno.test("unlock accepts the acknowledgement as a METHOD INPUT", async () => {
       { allowUnlock: true },
       makeContext(globalsFor(fake.path)).context,
     );
-    assertEquals(out.dataHandles.length, 0);
+    assertEquals(out.dataHandles.length, 1);
   } finally {
     fake.cleanup();
   }
+});
+
+Deno.test("unlock records the mutation it performed", async () => {
+  // The only change this suite can make to a repository must leave a dated,
+  // queryable record; otherwise a recurring stale lock accumulates no evidence.
+  const fake = await fakeRestic(`echo "successfully removed 3 locks"; exit 0`);
+  try {
+    const h = makeContext(globalsFor(fake.path));
+    await methods.unlock.execute({ allowUnlock: true }, h.context);
+    const rec = h.written.find((w) => w.spec === "maintenance");
+    assert(rec, "unlock wrote no maintenance resource");
+    assertEquals(rec.data.action, "unlock");
+    assertEquals(rec.data.succeeded, true);
+    assertEquals(rec.data.locksRemoved, 3);
+    assertEquals(rec.data.countReported, true);
+    assertEquals(rec.data.exitCode, 0);
+  } finally {
+    fake.cleanup();
+  }
+});
+
+Deno.test("an unreported lock count is null, never zero", async () => {
+  // Live-verified on restic 0.19.1: with nothing to remove, unlock exits 0 and
+  // prints NOTHING. Recording that as 0 would assert a number restic never
+  // gave — the lockFieldsAbsentCount lesson, in a new place.
+  const fake = await fakeRestic("exit 0");
+  try {
+    const h = makeContext(globalsFor(fake.path));
+    await methods.unlock.execute({ allowUnlock: true }, h.context);
+    const rec = h.written.find((w) => w.spec === "maintenance");
+    assert(rec);
+    assertEquals(rec.data.locksRemoved, null);
+    assertEquals(rec.data.countReported, false);
+  } finally {
+    fake.cleanup();
+  }
+});
+
+Deno.test("a FAILED unlock is recorded before it throws", async () => {
+  const fake = await fakeRestic(`echo "Fatal: wrong password" >&2; exit 12`);
+  try {
+    const h = makeContext(globalsFor(fake.path));
+    await assertRejects(
+      () => methods.unlock.execute({ allowUnlock: true }, h.context),
+      Error,
+      "unlock failed",
+    );
+    const rec = h.written.find((w) => w.spec === "maintenance");
+    assert(rec, "a failed unlock left no record at all");
+    assertEquals(rec.data.succeeded, false);
+    assertEquals(rec.data.exitCode, 12);
+    assertEquals(rec.data.failureReason, "wrong-password");
+  } finally {
+    fake.cleanup();
+  }
+});
+
+Deno.test("a refused unlock writes nothing — it changed nothing", async () => {
+  const h = makeContext(globalsFor("/bin/true"));
+  await assertRejects(
+    () => methods.unlock.execute({}, h.context),
+    Error,
+    "allowUnlock=true",
+  );
+  assertEquals(h.written.length, 0);
+});
+
+Deno.test("parseLocksRemoved never invents a count", () => {
+  assertEquals(parseLocksRemoved("successfully removed 7 locks"), 7);
+  assertEquals(parseLocksRemoved("successfully removed 1 lock"), 1);
+  assertEquals(parseLocksRemoved(""), null);
+  assertEquals(parseLocksRemoved("created new cache"), null);
+});
+
+Deno.test("unlock is not a rung on the validation ladder", () => {
+  // Folding it in would make a readiness report iterating rungs invent an
+  // "unlock-never-proven" finding — an alarm that trains you to ignore alarms.
+  const rungs = (model.resources as unknown as {
+    validation: { schema: { shape: { rung: { options: string[] } } } };
+  }).validation.schema.shape.rung.options;
+  assert(!rungs.includes("unlock"), "unlock leaked into the rung enum");
 });
 
 Deno.test("unlock never uses --remove-all, which would delete live locks", async () => {

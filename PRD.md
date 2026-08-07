@@ -213,6 +213,14 @@ does not equal a `find -type f` count of the restored tree.
 | --------------------------- | -------------------- | ----------------------------------------------------------------------- | ------------------------------------------------------ |
 | `@sntxrr/restic/repository` | `restic-repository/` | `repository/<name>` aggregate; `snapshot/<short_id>` in `detailed` mode | `check`, `verify`, `dump`, `restore`, `unlock` (gated) |
 
+Three specs: `repository` (rung 1), `validation` (one per rung 2-5), and
+`maintenance` - a record of the one mutation the suite performs. `unlock` writes
+`maintenance`, never `validation`, and is deliberately absent from the `rung`
+enum: it proves nothing about restorability, and a readiness report iterating
+rungs would otherwise invent an `unlock-never-proven` finding. An alarm that
+cannot mean anything is worse than no alarm - the same reasoning that makes
+`restic-version-floor` designed-but-not-derivable in section 9.
+
 | Report                     | Dir                 | Scope    | Reads                                                             |
 | -------------------------- | ------------------- | -------- | ----------------------------------------------------------------- |
 | `@sntxrr/restic/readiness` | `restic-readiness/` | workflow | every repository model's rung output, joined by the spec it wrote |

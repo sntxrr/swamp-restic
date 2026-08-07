@@ -288,6 +288,28 @@ export function safeFragment(value: string, max = 48): string {
 }
 
 /**
+ * Pull the removed-lock count out of `restic unlock`'s free text.
+ *
+ * `unlock` has no `--json` in any released restic, so this is text parsing and
+ * is treated as best-effort: a failure to match returns null, never 0.
+ *
+ * Live-verified against restic 0.19.1: with nothing to remove, `unlock` exits 0
+ * and prints NOTHING on either stream. The `successfully removed N locks` form
+ * is restic's message for N > 0 and is matched here, but it is NOT live-
+ * verified — manufacturing a genuinely stale lock needs a lock restic agrees is
+ * dead, and killing a backup mid-write leaves a partial file that `list locks`
+ * does not even report. So a successful unlock that prints nothing is recorded
+ * as "no count reported", which on 0.19.1 means zero — but the caller is never
+ * told a number restic did not give.
+ */
+export function parseLocksRemoved(stdout: string): number | null {
+  const match = /successfully removed (\d+) locks?/i.exec(stdout);
+  if (!match) return null;
+  const n = Number.parseInt(match[1], 10);
+  return Number.isFinite(n) ? n : null;
+}
+
+/**
  * Derive a short, stable name for a repository from its URL.
  *
  * `s3:s3.us-west-002.backblazeb2.com/heron-debian` -> `heron-debian`.
@@ -451,6 +473,35 @@ const ValidationSchema = z.object({
   verified: z.boolean().nullable(),
   estimatedBytes: z.number().nullable(),
   maxRestoreBytes: z.number().nullable(),
+});
+
+/**
+ * A record of the one mutation this suite is permitted.
+ *
+ * Deliberately NOT a rung on the validation ladder. `unlock` proves nothing
+ * about restorability, and folding it into `ValidationSchema` would make a
+ * readiness report iterating rungs invent an "unlock-never-proven" finding —
+ * nonsense, and the kind of alarm that trains an operator to ignore the real
+ * ones.
+ *
+ * `locksRemoved` is nullable and paired with `countReported` because restic's
+ * `unlock` has no `--json` and prints a count only when it removed something.
+ * Collapsing "restic did not say" into `0` is the same false reassurance as
+ * `legalHoldOnCount: 0` meaning "B2 never said" — see CONVENTIONS §4.3.
+ */
+const MaintenanceSchema = z.object({
+  repositoryName: z.string(),
+  action: z.literal("unlock"),
+  succeeded: z.boolean(),
+  /** null means restic reported no count — NOT that zero locks were removed. */
+  locksRemoved: z.number().nullable(),
+  /** False whenever the count is null, so the third state cannot be lost. */
+  countReported: z.boolean(),
+  failureReason: z.string().nullable(),
+  detail: z.string().nullable(),
+  exitCode: z.number(),
+  ranAt: z.string(),
+  durationMs: z.number(),
 });
 
 const GlobalArgsSchema = z.object({
@@ -723,6 +774,15 @@ export const model = {
         "The outcome of one validation-ladder rung — whether it passed, and " +
         "whether a failure was genuine or merely inconclusive",
       schema: ValidationSchema,
+      lifetime: "infinite" as const,
+      garbageCollection: 50,
+    },
+    "maintenance": {
+      description:
+        "A record of the one mutation this suite performs — a stale-lock " +
+        "removal, dated and queryable. Kept out of the validation stream " +
+        "because unlock proves nothing about restorability",
+      schema: MaintenanceSchema,
       lifetime: "infinite" as const,
       garbageCollection: 50,
     },
@@ -1277,18 +1337,46 @@ export const model = {
         }
 
         const name = repositoryName(g.repository);
+        const ranAt = new Date().toISOString();
         const run = await runRestic(
           credentialsOf(g),
           ["unlock"],
           runOptionsOf(g),
         );
-        if (run.code !== RESTIC_EXIT.OK) {
+        const ok = run.code === RESTIC_EXIT.OK;
+        const removed = parseLocksRemoved(run.stdout);
+
+        // Written on BOTH paths, and before the throw. This is the only change
+        // the suite can make to a repository, so a failed attempt is exactly as
+        // worth recording as a successful one — and a rung that throws without
+        // writing is the "clean sweep reported as no sweep" failure.
+        const handle = await context.writeResource("maintenance", "unlock", {
+          repositoryName: name,
+          action: "unlock" as const,
+          succeeded: ok,
+          locksRemoved: removed,
+          countReported: removed !== null,
+          failureReason: ok ? null : classifyFailure(run),
+          detail: ok ? null : run.stderr.slice(0, 2000) || null,
+          exitCode: run.code,
+          ranAt,
+          durationMs: run.durationMs,
+        });
+
+        if (!ok) {
           throw new Error(
             `restic unlock failed (${classifyFailure(run)}): ${run.stderr}`,
           );
         }
-        context.logger.info(`${name}: stale locks removed`);
-        return { dataHandles: [] };
+
+        context.logger.info(
+          `${name}: unlock succeeded — ${
+            removed === null
+              ? "restic reported no lock count"
+              : `${removed} stale lock(s) removed`
+          }`,
+        );
+        return { dataHandles: [handle] };
       },
     },
   },

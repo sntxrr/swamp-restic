@@ -140,6 +140,22 @@ would reject `--input allowUnlock=true` and force the flag to be armed
 permanently on the model definition, firing on the safe configuration and
 passing on the dangerous one.
 
+Writes a `maintenance` resource on **both** the success and the failure path, so
+the only change this suite can make to a repository is dated and queryable — a
+recurring stale lock on one repository should accumulate evidence, not vanish. A
+refused acknowledgement writes nothing, because nothing changed.
+
+`maintenance` is deliberately not a `validation` resource and `unlock` is not a
+rung: it proves nothing about restorability, and folding it into the ladder
+would make a readiness report iterating rungs invent an "unlock-never-proven"
+finding.
+
+`locksRemoved` is `number | null`, paired with `countReported`. restic's
+`unlock` has no `--json` and prints a count only when it removed something —
+verified against 0.19.1, where a repository with nothing to remove exits 0 and
+prints nothing at all. A null therefore means **restic reported no count**, not
+that zero locks were removed, and the two are never collapsed.
+
 ## restic version requirements
 
 Run an **upstream** restic on the validating host, not a distro package. The
