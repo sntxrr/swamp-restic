@@ -1,0 +1,25 @@
+manifestVersion: 1
+
+name: "@sntxrr/restic-repository"
+version: "2026.08.07.1"
+description: "Validate one restic repository from a neutral host — snapshot freshness and backup-scope drift, structural check, read-data verification against bitrot, a dump canary, and a size-capped restore drill that proves the backup can actually be restored. Strictly read-only: it refuses every restic write command and never takes a repository lock, so it can never break the backup it validates."
+repository: "https://github.com/sntxrr/swamp-restic"
+
+paths:
+  base: manifest
+
+models:
+  - restic_repository.ts
+
+additionalFiles:
+  - README.md
+  - LICENSE.md
+
+labels:
+  - restic
+  - backup
+  - restore
+  - validation
+  - disaster-recovery
+  - backblaze
+  - b2
