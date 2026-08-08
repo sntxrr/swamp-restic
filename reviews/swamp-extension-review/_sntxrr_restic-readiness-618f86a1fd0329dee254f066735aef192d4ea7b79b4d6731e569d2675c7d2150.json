@@ -1,0 +1,47 @@
+{
+  "extension": "@sntxrr/restic-readiness",
+  "version": "2026.08.08.1",
+  "reviewedAt": "2026-08-08T02:06:47Z",
+  "dimensions": [
+    {
+      "id": "credentials-secrets",
+      "verdict": "pass",
+      "note": "The report holds no credentials and makes no authenticated call \u2014 it reads resource snapshots the model already wrote. One dependency is worth stating rather than assuming: findings can carry a rung's `detail`, which is a slice of restic's stderr, and restic echoes its configuration into error messages. That stderr is redacted at the model's subprocess boundary before it is ever persisted, and that redaction is mutation-proven in the model's own harness. The report cannot re-redact \u2014 it never sees the secrets \u2014 so it inherits the guarantee rather than enforcing it. If the model's redaction ever regressed, this report would propagate the leak into a findings list."
+    },
+    {
+      "id": "logging-quality",
+      "verdict": "pass",
+      "note": "Emits no log lines, matching @sntxrr/b2/fleet-hygiene, which also emits none. For a report the markdown and JSON output IS the user-visible record, and the entry/completion logging convention exists for methods that otherwise leave no trace. Nothing is logged, so nothing sensitive can be logged."
+    },
+    {
+      "id": "error-handling",
+      "verdict": "pass",
+      "note": "Deliberately never throws, and this is a reasoned divergence from the narrow-try/catch guidance. A workflow-scope report that throws takes the workflow's summary down with it, which would destroy the audit trail for exactly the run that had a problem. `readSnapshot` and `readStandingRecord` catch broadly and return null \u2014 but the failure is NOT swallowed: a null repository snapshot degrades that repository to `scanned: false`, which raises a `repo-unreachable` finding and flips `fleetScanComplete` to false. The error becomes a visible finding rather than a silent omission. Proven by execution: MECH#5 drives a context whose getContent rejects every call and asserts the run still completes with repositoriesScanned 0 and fleetScanComplete false. The first live run also proved the degradation path on real data rather than a stub: four of eighteen repositories failed (three on a vault expression, one on a wrong restic password) and the report rendered all eighteen with fleetScanComplete false, rather than silently reporting a fourteen-repository fleet."
+    },
+    {
+      "id": "testing-completeness",
+      "verdict": "pass",
+      "note": "26 unit tests plus 12 mechanical checks, verified by exit status. `analyze` is pure and exported so findings are tested without a workflow context. FOUR guards are now mutation-proven: silencing the dormant exclusion, dropping the modelType fallback for failed steps, hardcoding standingRecordsReadable true, and \u2014 added after the first live run \u2014 keying repository identity on the step instead of the model. Each fails the suite."
+    },
+    {
+      "id": "idempotency-resilience",
+      "verdict": "pass",
+      "note": "Pure with respect to the world: it writes nothing, mutates nothing and calls no external service, so re-running it over the same execution yields the same output. Partial failure is the normal case rather than an edge case \u2014 a fleet run where some repositories failed is expected, and the report is built to describe that state accurately rather than to require completeness."
+    },
+    {
+      "id": "api-contracts",
+      "verdict": "pass",
+      "note": "No HTTP calls. The one contract worth verifying \u2014 `dataRepository.getContent(modelType, modelId, instanceName)` with no version, resolving an instance THIS run may not have written \u2014 was recorded as an ISSUE in the previous review because it was unverified and mocks could not settle it. It is now LIVE-VERIFIED against the real 18-repository fleet: `standingRecordsReadable` came back true on a run whose workflow contains no restore step at all, so the report is genuinely reading prior instances rather than falling back. The fail-safe path is retained and still tested \u2014 if every standing read fails, the flag goes false and the findings reword from 'never proven' to 'not proven in this run'."
+    },
+    {
+      "id": "resource-management",
+      "verdict": "pass",
+      "note": "Holds no network connections, file handles or temporary files. Reads are awaited sequentially per step; nothing is left open on any path, including the error paths, because there is nothing to close."
+    },
+    {
+      "id": "published-surface-hygiene",
+      "verdict": "pass",
+      "note": "Audited with the same method as the model extension: 49 real identifiers from the live inventory (25 B2 bucket names, 24 ansible hostnames) plus known short host names grepped against every file in the extension and its mechanical harness. The only match is `/var/lib/docker`, a filesystem path rather than the host or bucket of the same name. Fixtures and the README's sample output use fictional bird-named repositories (heron-debian, mallard-ubuntu, teal-debian) and host.example.net, consistent with the sanitisation already applied across this repo's history. Re-audited after the grouping fix; no identifiers were introduced. The live fleet run was read for counts and failure classes only \u2014 no real repository name reached any tracked file."
+    }
+  ]
+}

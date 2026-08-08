@@ -400,6 +400,38 @@ Deno.test("execute reads a restore from the standing record", async () => {
   assertStringIncludes(out.markdown, "prior run");
 });
 
+Deno.test("several steps against ONE model are one repository, not several", async () => {
+  // The real fleet workflow runs scan AND check against the same model
+  // instance, and later verify and restore too. Counting a repository per step
+  // reported 33 repositories for a fleet of 18 on the first live run. No mock
+  // caught it because every fixture had exactly one step per repository.
+  const scanStep = {
+    stepName: "freshness-heron",
+    modelType: "@sntxrr/restic/repository",
+    modelId: "m1",
+    status: "succeeded",
+    dataHandles: [{ name: "heron-debian", specName: "repository", version: 1 }],
+  };
+  const checkStep = {
+    stepName: "structure-heron",
+    modelType: "@sntxrr/restic/repository",
+    modelId: "m1",
+    status: "succeeded",
+    dataHandles: [{ name: "validation-check", specName: "validation", version: 1 }],
+  };
+  const out = await report.execute(ctx([scanStep, checkStep], SNAPS));
+  assertEquals(out.json.repositoriesExamined, 1, "one repository counted twice");
+  assertEquals(out.json.repositoriesScanned, 1);
+  assertEquals(out.json.fleetScanComplete, true);
+  // The rung evidence from the second step must reach the first step's repo.
+  const repos = out.json.repositories as Array<
+    { name: string; rungs: Record<string, unknown> }
+  >;
+  assertEquals(repos.length, 1);
+  assertEquals(repos[0].name, "heron-debian");
+  assert(repos[0].rungs["check"], "the check step's evidence was lost");
+});
+
 Deno.test("a failed step keeps the fleet total honest", async () => {
   const failed = {
     stepName: "validate-mallard",

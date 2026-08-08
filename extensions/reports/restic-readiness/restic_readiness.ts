@@ -588,14 +588,40 @@ export const report = {
     let standingReadAttempts = 0;
     let standingReadSuccesses = 0;
 
+    // Group the steps by MODEL, not one repository per step.
+    //
+    // A fleet workflow runs several steps against the SAME model instance —
+    // `scan` then `check`, and later `verify`/`restore` — and one model
+    // instance owns exactly one repository (PRD §3), so modelId is the stable
+    // key. Counting a repository per step reported 33 repositories for a fleet
+    // of 18 on the first live run, which is the mirror of every mock-vs-reality
+    // defect in this suite: the fixture had one step per repository, so no test
+    // could have caught it.
+    //
+    // modelId rather than repositoryName because a step that FAILED before
+    // writing anything has no repository name to join on, but still carries the
+    // model it ran against — and that step is precisely the one that must not
+    // vanish from the fleet.
+    const byModel = new Map<string, typeof repoSteps>();
     for (const step of repoSteps) {
-      const repoSnaps = await readSpec(context, step, "repository");
-      const validations = await readSpec(context, step, "validation");
-      const maintenance = await readSpec(context, step, "maintenance");
+      const key = String(step?.modelId ?? step?.stepName ?? "unknown");
+      const group = byModel.get(key);
+      if (group) group.push(step);
+      else byModel.set(key, [step]);
+    }
 
-      // A step that wrote no repository resource still names a repository —
-      // via its validation output, or failing that via the step itself. The
-      // fallback name keeps a failed scan visible in the fleet count.
+    for (const group of byModel.values()) {
+      const repoSnaps: Record<string, unknown>[] = [];
+      const validations: Record<string, unknown>[] = [];
+      const maintenance: Record<string, unknown>[] = [];
+      for (const s of group) {
+        repoSnaps.push(...await readSpec(context, s, "repository"));
+        validations.push(...await readSpec(context, s, "validation"));
+        maintenance.push(...await readSpec(context, s, "maintenance"));
+      }
+      // Any step in the group can name the repository. The step name is the
+      // last resort and keeps a wholly failed model visible in the fleet count.
+      const step = group[0];
       const repo = repoSnaps[0] ?? null;
       const name = str(repo?.repositoryName) ??
         str(validations[0]?.repositoryName) ??
