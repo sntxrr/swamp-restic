@@ -180,8 +180,13 @@ landed late:
    The four compression fields are meaningful only on format v2.
    `total_file_count` is documented but **was absent** in `raw-data` mode —
    type it optional. Modes differ in meaning: `raw-data` gives stored bytes,
-   `restore-size` gives the logical bytes a restore would write. Size a restore
-   guard with `restore-size`; report storage cost with `raw-data`.
+   `restore-size` gives the logical bytes a restore would write. Report storage
+   cost with `raw-data`.
+
+   **Do not size a restore guard with `stats --mode restore-size`.** It works
+   only for a whole snapshot; the moment the target is a subtree it rejects the
+   selector and returns a zero that reads as a safe size. See §11 — that guard
+   shipped inoperative, and this line is how it got written.
 
 6. **`restore --json` emits JSON-lines**: repeated `status` objects then one
    `summary`. Parse the **last** `summary` line; do not assume a single line of

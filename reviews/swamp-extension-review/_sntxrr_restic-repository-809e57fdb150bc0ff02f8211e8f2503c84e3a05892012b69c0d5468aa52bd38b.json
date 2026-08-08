@@ -1,0 +1,82 @@
+{
+  "extension": "@sntxrr/restic-repository",
+  "version": "2026.08.07.2",
+  "reviewedAt": "2026-08-08T00:57:22Z",
+  "dimensions": [
+    {
+      "id": "credentials-secrets",
+      "verdict": "pass",
+      "note": "password and secretAccessKey are marked sensitive; accessKeyId deliberately is not, matching all five published @sntxrr/b2/* extensions where the key ID is an identifier and the secret half is separate. Credentials travel only by environment: the runner refuses to spawn if a secret appears in argv (ps is world-readable), and stderr is redacted at the subprocess boundary because restic echoes its configuration into error messages. Both guards are executed in reviews/mechanical-verification.ts and mutation-proven \u2014 removing the redaction call fails the suite."
+    },
+    {
+      "id": "logging-quality",
+      "verdict": "pass",
+      "note": "Each method logs a completion line carrying the facts an operator needs (snapshot count, age, staleness, missing paths, restored items/bytes/duration); scan logs warn on an unreachable repository. unlock now distinguishes 'N stale lock(s) removed' from 'restic reported no lock count' rather than claiming a number it was never given. An executed check asserts no planted credential reaches any log line."
+    },
+    {
+      "id": "error-handling",
+      "verdict": "pass",
+      "note": "Deliberate, reasoned divergence from 'throw before writing data': the rung methods \u2014 and now unlock \u2014 write their resource and THEN throw. The resource IS the outcome; a failed rung that writes nothing is the 'clean sweep reported as no sweep' failure this suite has already hit once, and the record is complete rather than partial, so the guidance's rationale does not apply. Failures carry a classified reason plus redacted stderr, and `inconclusive` (lock conflict, timeout) is kept distinct from `passed: false` so a healthy repository is never reported broken."
+    },
+    {
+      "id": "testing-completeness",
+      "verdict": "pass",
+      "note": "60 unit tests + 22 mechanical checks, both verified by exit status rather than by reading a count \u2014 which earned its keep this round: adding parseLocksRemoved without its import aborted the suite at type-check, reporting zero failures. The writeResource stub validates against the real spec schema. Tests drive the real subprocess boundary via a fake restic binary. Three guards are mutation-proven (instance-name hashing, stderr redaction, and the null lock count); each mutation fails both suites. Re-run for 2026.08.07.2 by exit status: 60 unit, 22 mechanical, both 0."
+    },
+    {
+      "id": "idempotency-resilience",
+      "verdict": "pass",
+      "note": "Every ladder rung is read-only and repeatable by construction. `unlock` is idempotent in the sense that matters \u2014 live-verified against restic 0.19.1 that a repository with nothing to remove exits 0 rather than erroring, so a re-run is safe. What is NOT live-verified is the N>0 path: manufacturing a genuinely stale lock needs a lock restic agrees is dead, and killing a backup mid-write leaves a partial file that `restic list locks` does not even report. The count parser is therefore treated as best-effort and returns null rather than a guess."
+    },
+    {
+      "id": "api-contracts",
+      "verdict": "pass",
+      "note": "restic's JSON output is the external contract and it is parsed permissively: an unknown message_type is never an error and non-JSON lines are skipped, because restic 0.19.0 leaks a progress bar into JSON mode. Per-feature version floors are documented (PRD \u00a76). `unlock` has no --json in any released restic, which was confirmed against the 0.19.1 binary rather than assumed, so its count is free-text parsed and nullable. Live verification also found the inoperative restore size guard: `restic stats` rejects the <snapshot>:<subfolder> selector, warns on stderr, then exits 0 with total_size 0 \u2014 measurement now uses a dry-run restore and fails closed. Re-reviewed for 2026.08.07.2, which is a documentation-only change: `restore`'s method description said the ceiling \"is measured with stats --mode restore-size\", naming the exact approach the code abandoned because it is inoperative on a subtree. A published description that tells an operator the wrong mechanism is a false contract even when the code is right, and this one pointed at the trap rather than away from it. Now reads \"measured with a dry-run restore\", matching the implementation and CONVENTIONS \u00a711."
+    },
+    {
+      "id": "resource-management",
+      "verdict": "pass",
+      "note": "command.output() drains both pipes, so no handles dangle; the timeout timer is cleared in a finally block and the abort path returns a typed CANCELLED result rather than leaking the AbortError. The model creates no temporary files \u2014 the restore target is operator-supplied."
+    },
+    {
+      "id": "published-surface-hygiene",
+      "verdict": "pass",
+      "note": "Full pre-publish audit run this session per PRD \u00a710.9: 49 real identifiers (25 B2 bucket names from the live inventory, 24 ansible inventory hostnames) plus known short host names grepped against the tracked tree, the exact shipped-file list, and the full git history including commit messages. Zero real identifiers in shipped files \u2014 every /var/lib/docker hit is a filesystem path, and fixtures use s3.example.invalid, host.example.net and fictional bird-named buckets. One real host name was found in PRD.md (not a shipped file) and removed. The scratch repository used to verify unlock's output was created under the job temp directory with a throwaway password and destroyed. For 2026.08.07.2 the same audit was re-run against the changed files; no identifiers were introduced. CONVENTIONS \u00a75 was also corrected \u2014 it still instructed future work to \"size a restore guard with restore-size\", contradicting \u00a711 and being the line that produced the inoperative guard in the first place. Not a shipped file, but it is how the defect would have been rebuilt."
+    },
+    {
+      "id": "schema-strictness",
+      "verdict": "pass",
+      "note": "All four specs are plain z.object with no passthrough, asserted by an executed check rather than by reading."
+    },
+    {
+      "id": "lifetime-gc",
+      "verdict": "pass",
+      "note": "All four specs declare lifetime and garbageCollection (repository 50, snapshot 200, validation 50, maintenance 50), asserted by an executed check that iterates the resource map rather than naming specs, so a new spec cannot be added without one."
+    },
+    {
+      "id": "crud-completeness",
+      "verdict": "pass",
+      "note": "Resolved since the previous review, which recorded this as an ISSUE. No create/update/delete remains correct and is the load-bearing scope boundary, not an omission: the ansible restic role owns the write path, and two systems mutating the same repositories on overlapping schedules is how backups are lost (PRD \u00a72). The narrower gap that review found \u2014 `unlock` returning no dataHandles, leaving the only change this tooling can make with no queryable record \u2014 is now fixed. It writes a `maintenance` resource on both the success and failure paths, and a refused acknowledgement still writes nothing because nothing changed. `maintenance` is deliberately a separate spec rather than a fifth rung: unlock proves nothing about restorability, and folding it into the ladder would make a readiness report iterating rungs invent an 'unlock-never-proven' finding, which is an alarm that trains an operator to ignore alarms."
+    },
+    {
+      "id": "preflight-checks",
+      "verdict": "pass",
+      "note": "Two policy-labelled checks (repository URL has a backend scheme; both credential halves and the password are non-empty). Deliberately no check gates a method input: swamp never passes method inputs to checks, so a check gating unlock or the restore ceiling would reject the per-run acknowledgement and force the flag to be armed permanently on the model \u2014 the exact defect that made b2-transfer's delete unusable and had to be removed from the published b2-files. Both gates live in execute, and a test asserts no check reads an acknowledgement input."
+    },
+    {
+      "id": "instance-names",
+      "verdict": "pass",
+      "note": "Mechanical check #3 found a real defect here and it was fixed before publish: safeFragment truncated at 48 characters with no hash, so two repositories whose URL tails share a 48-character prefix collapsed onto one instance name and would silently clobber each other on disk \u2014 one repository's validation status reported as another's. B2 bucket names run to 50 characters, so the cut is reachable without exotic input. Fixed with the b2-transfer precedent (FNV-1a suffix over the FULL input, applied only when truncation occurs, so ordinary short names keep their readable form and no existing instance is renamed). Mutation-proven. The new `maintenance` spec uses the fixed instance name `unlock`, which cannot collide with `repository/<name>`, `snapshot-<short_id>` or `validation-<rung>`; an executed check enumerates every instance written in one execution and asserts no two specs share one."
+    },
+    {
+      "id": "data-access",
+      "verdict": "pass",
+      "note": "No direct dataRepository or getContent access anywhere. No method calls readResource, and none needs to: each ladder rung is independent and stateless, deriving everything from the live repository rather than from prior swamp state. Cross-rung joining is the readiness report's job, at workflow scope."
+    },
+    {
+      "id": "version-upgrades",
+      "verdict": "na",
+      "note": "2026.08.07.2 changes only a method description and carries no schema change, so no upgrades entry is applicable \u2014 an upgrades entry exists to migrate stored data, and nothing stored has changed shape. Strictly compatible with 2026.08.07.1: every instance, resource and argument is unchanged."
+    }
+  ]
+}

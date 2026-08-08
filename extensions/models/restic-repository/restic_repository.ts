@@ -750,7 +750,7 @@ async function runCheck(
 
 export const model = {
   type: "@sntxrr/restic/repository",
-  version: "2026.08.07.1",
+  version: "2026.08.07.2",
   globalArguments: GlobalArgsSchema,
 
   resources: {
@@ -1170,7 +1170,7 @@ export const model = {
       description:
         "Rung 5. Restore a scoped subtree to a local target and verify it — " +
         "the only rung that actually proves the backup is restorable. The " +
-        "size ceiling is measured with stats --mode restore-size and " +
+        "size ceiling is measured with a dry-run restore and " +
         "enforced BEFORE any data moves, so a refused drill costs nothing. " +
         "Raise it per run rather than permanently.",
       arguments: RestoreArgsSchema,
