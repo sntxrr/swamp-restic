@@ -150,7 +150,10 @@ Deno.test("check failures are critical but lock conflicts are not", () => {
     b.find((f) => f.code === "check-inconclusive")?.severity,
     "low",
   );
-  assert(!codes(b).includes("check-failing"), "a lock conflict read as failure");
+  assert(
+    !codes(b).includes("check-failing"),
+    "a lock conflict read as failure",
+  );
 });
 
 // ---------------------------------------------------------------------------
@@ -158,12 +161,19 @@ Deno.test("check failures are critical but lock conflicts are not", () => {
 // ---------------------------------------------------------------------------
 
 Deno.test("a dormant repository is excluded from staleness but still counted", () => {
-  const s = repoState({ dormant: true, stale: false, latestSnapshotAgeHours: 900 });
+  const s = repoState({
+    dormant: true,
+    stale: false,
+    latestSnapshotAgeHours: 900,
+  });
   const { findings, dormantExcluded } = analyze([s], OPTS);
   assertEquals(dormantExcluded, ["heron-debian"]);
   assert(!codes(findings).includes("repo-stale"));
   const info = findings.find((f) => f.code === "repo-dormant-declared");
-  assert(info, "the exclusion was silent — 'found none' now hides 'left some out'");
+  assert(
+    info,
+    "the exclusion was silent — 'found none' now hides 'left some out'",
+  );
   assertEquals(info.severity, "info");
 });
 
@@ -178,7 +188,10 @@ Deno.test("a stale non-dormant repository is high severity", () => {
 // ---------------------------------------------------------------------------
 
 Deno.test("backup-scope drift names the missing paths", () => {
-  const s = repoState({ scopeDrift: true, missingPaths: ["/root", "/var/lib/docker"] });
+  const s = repoState({
+    scopeDrift: true,
+    missingPaths: ["/root", "/var/lib/docker"],
+  });
   const { findings } = analyze([s], OPTS);
   const f = findings.find((f) => f.code === "backup-scope-drift");
   assert(f);
@@ -200,7 +213,10 @@ Deno.test("an empty repository is orphaned, not stale", () => {
   const s = repoState({ snapshotCount: 0, stale: true });
   const { findings } = analyze([s], OPTS);
   assert(codes(findings).includes("repo-orphaned"));
-  assert(!codes(findings).includes("repo-stale"), "an empty repo double-reported");
+  assert(
+    !codes(findings).includes("repo-stale"),
+    "an empty repo double-reported",
+  );
 });
 
 // ---------------------------------------------------------------------------
@@ -291,8 +307,10 @@ function ctx(
   // deno-lint-ignore no-explicit-any
   steps: any[],
   snapshots: Record<string, unknown>,
-  opts: { standingRecords?: Record<string, unknown>; throwOnStanding?: boolean } =
-    {},
+  opts: {
+    standingRecords?: Record<string, unknown>;
+    throwOnStanding?: boolean;
+  } = {},
 ) {
   return {
     scope: "workflow",
@@ -310,7 +328,9 @@ function ctx(
             name in opts.standingRecords
           ? opts.standingRecords
           : snapshots;
-        if (version === undefined && opts.throwOnStanding && !(name in snapshots)) {
+        if (
+          version === undefined && opts.throwOnStanding && !(name in snapshots)
+        ) {
           return Promise.reject(new Error("datastore declined"));
         }
         const snap = (bag as Record<string, unknown>)[name];
@@ -417,10 +437,18 @@ Deno.test("several steps against ONE model are one repository, not several", asy
     modelType: "@sntxrr/restic/repository",
     modelId: "m1",
     status: "succeeded",
-    dataHandles: [{ name: "validation-check", specName: "validation", version: 1 }],
+    dataHandles: [{
+      name: "validation-check",
+      specName: "validation",
+      version: 1,
+    }],
   };
   const out = await report.execute(ctx([scanStep, checkStep], SNAPS));
-  assertEquals(out.json.repositoriesExamined, 1, "one repository counted twice");
+  assertEquals(
+    out.json.repositoriesExamined,
+    1,
+    "one repository counted twice",
+  );
   assertEquals(out.json.repositoriesScanned, 1);
   assertEquals(out.json.fleetScanComplete, true);
   // The rung evidence from the second step must reach the first step's repo.
@@ -457,4 +485,68 @@ Deno.test("an unreadable standing record is disclosed, not assumed", async () =>
   );
   assertEquals(out.json.standingRecordsReadable, false);
   assertStringIncludes(out.markdown, "prior-run records could not be read");
+});
+
+// Both regressions below were found by the first live fleet run, 2026-08-17.
+
+Deno.test("a failed step is named by its model, not by the workflow's step label", async () => {
+  // The real workflow uses TWO steps per repository ("freshness-x",
+  // "structure-x"), so falling back to stepName produced a finding whose
+  // subject was `freshness-mallard-debian` — a step, in a report whose subjects
+  // are otherwise repositories. modelName is the repository's identity and is
+  // what an operator would type to reproduce the failure.
+  const failed = {
+    stepName: "freshness-mallard-debian",
+    modelName: "restic-mallard-debian",
+    modelType: "@sntxrr/restic/repository",
+    modelId: "m9",
+    status: "failed",
+    dataHandles: [],
+  };
+  const out = await report.execute(ctx([failed], SNAPS));
+  assertStringIncludes(out.markdown, "restic-mallard-debian");
+  assertEquals(
+    out.markdown.includes("freshness-mallard-debian"),
+    false,
+    "the step label leaked into a repository-scoped finding",
+  );
+});
+
+Deno.test("an unscanned repository tells the operator how to get the real reason", async () => {
+  // A report cannot see a step's error text — stepExecutions carries no error
+  // field — and a vault-resolution failure kills the step upstream of execute,
+  // so the model leaves no reachable:false snapshot either. The finding must
+  // therefore hand over the command that does print the reason, rather than
+  // leaving "did not complete" as the whole story.
+  const failed = {
+    stepName: "freshness-mallard-debian",
+    modelName: "restic-mallard-debian",
+    modelType: "@sntxrr/restic/repository",
+    modelId: "m9",
+    status: "failed",
+    dataHandles: [],
+  };
+  const out = await report.execute(ctx([failed], SNAPS));
+  assertStringIncludes(out.markdown, "method run scan restic-mallard-debian");
+});
+
+Deno.test("a failed step with no model name still reports, without inventing a command", async () => {
+  // modelName is documented but must not be load-bearing: if the runtime ever
+  // omits it, the repository must still be counted and must not render a
+  // half-built command with an empty instance name.
+  const failed = {
+    stepName: "freshness-orphan",
+    modelType: "@sntxrr/restic/repository",
+    modelId: "m10",
+    status: "failed",
+    dataHandles: [],
+  };
+  const out = await report.execute(ctx([failed], SNAPS));
+  assertEquals(out.json.repositoriesExamined, 1, "the repository vanished");
+  assertStringIncludes(out.markdown, "scan method directly");
+  assertEquals(
+    out.markdown.includes("method run scan \n"),
+    false,
+    "rendered a command with an empty model name",
+  );
 });

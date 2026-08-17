@@ -598,6 +598,16 @@ be used there.
    fetchable by SHA — so an identifier that reaches a public repo is not
    retractable by rewriting history.
 
+   **"Pre-publish" is the wrong deadline: audit before you PUSH.** This repo is
+   public, so a branch and its PR body are world-readable the instant they are
+   pushed — long before `extension publish` runs. Violated on 2026-08-17, when a
+   fix branch carried a real host name and a real 1Password vault name into the
+   diff, the commit message and the PR description. Redaction after the fact
+   left the original commit fetchable by SHA and the pre-edit PR body visible in
+   GitHub's edit history, which is exactly what the paragraph above warns about.
+   Sanitise while writing: this suite's placeholder hosts are `heron` and
+   `mallard`, and there is never a reason for a real one to appear.
+
 The single most reliable finding across this project: **live verification beat
 mocks every time.** Every wave of the B2 suite shipped defects that a green
 test suite could not see, and every one was found by running the thing against
