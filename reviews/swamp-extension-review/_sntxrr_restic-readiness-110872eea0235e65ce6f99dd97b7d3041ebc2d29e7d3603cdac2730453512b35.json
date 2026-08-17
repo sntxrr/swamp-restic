@@ -1,0 +1,47 @@
+{
+ "extension": "@sntxrr/restic-readiness",
+ "version": "2026.08.17.1",
+ "reviewedAt": "2026-08-17T21:38:34Z",
+ "dimensions": [
+  {
+   "id": "credentials-secrets",
+   "verdict": "pass",
+   "note": "No credentials are held or transmitted; the report still only reads snapshots the model already wrote. This version does introduce one new consideration and it is stated rather than assumed: the repo-unreachable finding now embeds `modelName` in user-visible text as a runnable command. In a real deployment those instance names encode host identity (restic-<host>-<distro>), so a findings list is now marginally more identifying than before. That is a deliberate trade -- the previous text left an operator with no way to reach the real error, because a vault-resolution failure kills the step upstream of execute and stepExecutions carries no error field. The identifier was already present in the workflow definition the reader is looking at. Nothing new is persisted, and the shipped source itself was audited clean of real names (placeholders heron/mallard only)."
+  },
+  {
+   "id": "logging-quality",
+   "verdict": "pass",
+   "note": "Unchanged: emits no log lines. The markdown and JSON output is the user-visible record for a report."
+  },
+  {
+   "id": "error-handling",
+   "verdict": "pass",
+   "note": "No new failure mode. The added path is a ternary on r.modelName, and str() returns null for a non-string OR an empty string (typeof v === 'string' && v.length > 0), so an empty modelName degrades to the generic sentence rather than rendering `method run scan ` with a dangling argument. That equivalence is by construction, not by test; the absent-modelName case is covered directly."
+  },
+  {
+   "id": "testing-completeness",
+   "verdict": "pass",
+   "note": "Three regressions added, each tied to an observed defect rather than to coverage: subject is the model not the step label, the finding carries the reproduce command, and a step with no modelName still counts without emitting an empty command. 29 tests pass. Honest gap: the empty-string modelName case is argued from str()'s implementation rather than asserted, and the modelName fallback has not been exercised against a live failing step -- the post-fix fleet run had zero unreachable repositories, which is the correct outcome but means this path was proven by unit test only."
+  },
+  {
+   "id": "idempotency-resilience",
+   "verdict": "pass",
+   "note": "analyze() remains pure and total over its input; the change adds a field read and a string branch. No retries, no I/O, no ordering dependence introduced."
+  },
+  {
+   "id": "api-contracts",
+   "verdict": "pass",
+   "note": "The report's JSON output is an explicit field pick (repositories.map to name/scanned/reachable/dormant/snapshotCount/latestSnapshotTime/stale/scopeDrift/hostnameDrift/totalSizeBytes/rungs) and modelName was deliberately NOT added to it. So the machine-readable contract is unchanged and only the human-facing markdown differs. modelName is consumed from stepExecutions, which swamp documents as carrying jobName, stepName, modelName, modelType, methodName, status, dataHandles, methodArgs, modelId and globalArgs -- a documented field, and treated as optional so it cannot become load-bearing."
+  },
+  {
+   "id": "resource-management",
+   "verdict": "pass",
+   "note": "Unchanged. No handles, subprocesses or timers; the report reads already-materialised snapshots."
+  },
+  {
+   "id": "published-surface-hygiene",
+   "verdict": "pass",
+   "note": "Shipped file list (restic_readiness.ts, README.md, LICENSE.md) grepped for every real host, bucket, vault, domain, tailnet and B2 account identifier: clean. An earlier revision of this same change did leak a real host name and vault name into the diff, commit message and PR body; all three were redacted to the suite's placeholders before merge, and CONVENTIONS 9.7 was amended to move the audit deadline from pre-publish to pre-push, since a public repo is readable the moment a branch is pushed. A pre-push hook now enforces it mechanically."
+  }
+ ]
+}
