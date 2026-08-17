@@ -237,6 +237,15 @@ export function humanBytes(bytes: number | null): string {
 /** One repository's joined state, as the report understands it. */
 export type RepositoryState = {
   name: string;
+  /**
+   * The model instance the step ran against, when the run reported one.
+   *
+   * Kept separately from `name` because when a step fails before writing
+   * anything the two are the only identities available, and only this one can
+   * be pasted back into a command to reproduce the failure. Optional so
+   * hand-built test state stays terse.
+   */
+  modelName?: string | null;
   scanned: boolean;
   reachable: boolean | null;
   failureReason: string | null;
@@ -273,13 +282,33 @@ export function analyze(
 
   for (const r of repos) {
     if (!r.scanned) {
+      // The step's error text is deliberately NOT quoted here, because a report
+      // cannot see it: `stepExecutions` carries jobName, stepName, modelName,
+      // modelType, methodName, status, dataHandles, methodArgs, modelId and
+      // globalArgs — and no error field. Nor can the model be relied on to have
+      // left the reason behind: a vault expression is resolved UPSTREAM of
+      // execute, so a missing 1Password item kills the step before any code
+      // runs that could write a reachable:false snapshot. Observed 2026-08-17,
+      // when `restic-mallard-debian` failed with
+      //   Item "restic-mallard-debian" not found in vault "<vault>"
+      // and left nothing behind at all.
+      //
+      // So rather than pretend to a reason it does not have, the finding names
+      // the one command that WILL print it.
+      const how = r.modelName
+        ? `Run \`swamp model @'@sntxrr/restic/repository' method run scan ${r.modelName}\` ` +
+          "to see the underlying error."
+        : "Run this repository's scan method directly to see the underlying error.";
       findings.push({
         severity: "high",
         code: "repo-unreachable",
         subject: r.name,
         detail:
           "This repository's step did not complete, so nothing about it was " +
-          "measured in this run.",
+          "measured in this run. The step failed before writing any snapshot, " +
+          "which is what a credential or vault-resolution failure looks like — " +
+          "those happen before the model runs, so no reason is recorded. " +
+          how,
         impact:
           "A repository that could not be examined is not a repository known " +
           "to be healthy. It is reported rather than omitted precisely so a " +
@@ -619,13 +648,28 @@ export const report = {
         validations.push(...await readSpec(context, s, "validation"));
         maintenance.push(...await readSpec(context, s, "maintenance"));
       }
-      // Any step in the group can name the repository. The step name is the
-      // last resort and keeps a wholly failed model visible in the fleet count.
+      // Any step in the group can name the repository. Failing that, prefer the
+      // MODEL name over the step name.
+      //
+      // Both are last resorts, but they are not equally good. `modelName` is the
+      // instance the workflow ran against — a stable repository identity, the
+      // same string an operator would type to reproduce the failure. `stepName`
+      // is a label the workflow author chose, and this workflow happens to use
+      // two per repository ("freshness-x", "structure-x"), so falling back to it
+      // rendered findings whose subject was a step in a report whose subjects
+      // are otherwise repositories. Measured on the first live fleet run
+      // (2026-08-17): `mallard-debian` was reported as `freshness-mallard-debian`.
+      //
+      // This is the same principle already applied to modelType in
+      // isRepositoryStep: key on what the extension defines, not on what the
+      // workflow author names things.
       const step = group[0];
       const repo = repoSnaps[0] ?? null;
+      const modelName = str(step?.modelName);
       const name = str(repo?.repositoryName) ??
         str(validations[0]?.repositoryName) ??
         str(maintenance[0]?.repositoryName) ??
+        modelName ??
         String(step?.stepName ?? "unknown-repository");
 
       const rungs: Record<string, RungEvidence> = {};
@@ -663,6 +707,7 @@ export const report = {
       const unlockSnap = maintenance[0] ?? null;
       states.push({
         name,
+        modelName,
         scanned: repo !== null,
         reachable: repo === null ? null : repo.reachable === true,
         failureReason: str(repo?.failureReason),
