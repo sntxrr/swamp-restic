@@ -550,3 +550,34 @@ Deno.test("a failed step with no model name still reports, without inventing a c
     "rendered a command with an empty model name",
   );
 });
+
+Deno.test("a failed step whose model name is the empty string still has a subject", async () => {
+  // The sibling test above covers modelName being ABSENT. This covers it being
+  // present and EMPTY, which is a different path in a language where "" is a
+  // legitimate string. The rendering of the "how to get the real reason" line
+  // already guards itself with a truthiness test, so that is not what breaks:
+  // what breaks is the repository's IDENTITY. `name` resolves through a chain
+  // of `??`, and `??` accepts "" — so without `str()` collapsing "" to null,
+  // every finding for this repository is filed under the empty subject and the
+  // row cannot be traced back to anything. `str()` is the guard; this asserts it.
+  const failed = {
+    stepName: "freshness-orphan",
+    modelName: "",
+    modelType: "@sntxrr/restic/repository",
+    modelId: "m11",
+    status: "failed",
+    dataHandles: [],
+  };
+  const out = await report.execute(ctx([failed], SNAPS));
+  assertEquals(out.json.repositoriesExamined, 1, "the repository vanished");
+
+  const subjects = (out.json.findings as Array<{ subject: string }>)
+    .map((f) => f.subject);
+  assertEquals(
+    subjects.some((s) => s === ""),
+    false,
+    "a finding was filed under the empty subject",
+  );
+  assertStringIncludes(out.markdown, "freshness-orphan");
+  assertStringIncludes(out.markdown, "scan method directly");
+});
