@@ -579,7 +579,12 @@ be used there.
 
 ## 9. Verification and publish sequence
 
-1. `deno check` and `deno test` — **confirm the exit status.**
+1. `deno check` and `deno test -A` — **confirm the exit status.**
+   The `-A` is not optional and not laziness: the model's tests write a
+   temporary restore target, so plain `deno test` reports
+   `NotCapable: Requires write access` on 30 of the 90 tests. That reads
+   exactly like a broken suite on a clean checkout, which is how this line
+   came to be wrong in the first place.
 2. `swamp extension fmt --check`
 3. `swamp extension quality` ≥ 14/15
 4. Live read-only smoke against a real repository.
