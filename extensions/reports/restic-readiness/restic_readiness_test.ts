@@ -52,7 +52,9 @@ function repoState(over: Partial<RepositoryState> = {}): RepositoryState {
   };
 }
 
-const OPTS = { standingRecordsReadable: true };
+// `now` is pinned for the same reason the report accepts it: without it these
+// fixtures are aged against the wall clock and start failing on a calendar date.
+const OPTS = { standingRecordsReadable: true, now: NOW };
 const codes = (fs: { code: string }[]) => fs.map((f) => f.code);
 
 // ---------------------------------------------------------------------------
@@ -314,6 +316,7 @@ function ctx(
 ) {
   return {
     scope: "workflow",
+    now: NOW,
     stepExecutions: steps,
     logger: { info: () => {}, warn: () => {} },
     dataRepository: {
@@ -580,4 +583,123 @@ Deno.test("a failed step whose model name is the empty string still has a subjec
   );
   assertStringIncludes(out.markdown, "freshness-orphan");
   assertStringIncludes(out.markdown, "scan method directly");
+});
+
+// ---------------------------------------------------------------------------
+// A proof that has lapsed
+// ---------------------------------------------------------------------------
+
+const daysBefore = (n: number) =>
+  new Date(NOW - n * 86_400_000).toISOString();
+
+Deno.test("a restore older than the limit is reported as stale", () => {
+  const s = repoState({
+    rungs: {
+      "check": evidence(),
+      "read-data": evidence(),
+      "restore": evidence({ ranAt: daysBefore(45) }),
+    },
+  });
+  const { findings } = analyze([s], OPTS);
+  assertEquals(codes(findings), ["restore-proof-stale"]);
+  const stale = findings.find((f) => f.code === "restore-proof-stale")!;
+  assertEquals(stale.severity, "high");
+  assertStringIncludes(stale.detail, "45 days ago");
+});
+
+Deno.test("a stale proof is NOT also reported as never proven", () => {
+  // The two findings are mutually exclusive by construction — one says the
+  // evidence is absent, the other that it is old — and emitting both would
+  // double-count the repository in a findings list people triage top-down.
+  const s = repoState({
+    rungs: { "restore": evidence({ ranAt: daysBefore(400) }) },
+  });
+  const { findings } = analyze([s], OPTS);
+  assertEquals(
+    codes(findings).filter((c) => c.startsWith("restore-")),
+    ["restore-proof-stale"],
+  );
+});
+
+Deno.test("the limit is inclusive: a proof exactly at the boundary still counts", () => {
+  // Asserted on both sides of the boundary in one test, because an off-by-one
+  // here is invisible in production for 30 days and then fires on every
+  // repository at once.
+  const at = repoState({
+    rungs: { "restore": evidence({ ranAt: daysBefore(30) }) },
+  });
+  const over = repoState({
+    rungs: { "restore": evidence({ ranAt: daysBefore(30.5) }) },
+  });
+  assertEquals(
+    codes(analyze([at], OPTS).findings).includes("restore-proof-stale"),
+    false,
+    "a proof exactly at the limit was called stale",
+  );
+  assertEquals(
+    codes(analyze([over], OPTS).findings).includes("restore-proof-stale"),
+    true,
+    "a proof past the limit was not called stale",
+  );
+});
+
+Deno.test("a restore whose timestamp cannot be read is stale, not fresh", () => {
+  // Fail closed, exactly as the restore method treats an unmeasurable size. An
+  // age that cannot be established must never buy a pass, or a malformed
+  // timestamp becomes a permanent clean bill — the bug this finding closes.
+  for (const ranAt of [null, "not-a-date"]) {
+    const s = repoState({
+      rungs: {
+        "check": evidence(),
+        "read-data": evidence(),
+        "restore": evidence({ ranAt }),
+      },
+    });
+    const { findings } = analyze([s], OPTS);
+    const stale = findings.find((f) => f.code === "restore-proof-stale");
+    assert(stale, `an unreadable ranAt (${ranAt}) was treated as a fresh proof`);
+    assertStringIncludes(stale.detail, "could not be read");
+  }
+});
+
+Deno.test("a failing restore is still restore-failing, not stale", () => {
+  const s = repoState({
+    rungs: {
+      "restore": evidence({ passed: false, ranAt: daysBefore(90) }),
+    },
+  });
+  assertEquals(
+    codes(analyze([s], OPTS).findings).filter((c) => c.startsWith("restore-")),
+    ["restore-failing"],
+  );
+});
+
+Deno.test("the headline counts fresh proofs, and the table marks the stale ones", async () => {
+  // The headline is the whole point. A report that says "1 of 1 repositories
+  // have a proven restore" directly above a finding saying that proof lapsed is
+  // the contradiction this feature exists to remove.
+  const stale = {
+    stepName: "freshness-heron-debian",
+    modelName: "restic-heron-debian",
+    modelType: "@sntxrr/restic/repository",
+    modelId: "m1",
+    status: "succeeded",
+    dataHandles: [{ specName: "repository", dataName: "heron-debian" }],
+  };
+  const out = await report.execute(ctx([stale], SNAPS, {
+    standingRecords: {
+      "validation-restore": {
+        repositoryName: "heron-debian",
+        rung: "restore",
+        passed: true,
+        inconclusive: false,
+        ranAt: daysBefore(120),
+      },
+    },
+  }));
+  assertStringIncludes(out.markdown, "**0 of 1 repositories have a restore");
+  assertStringIncludes(out.markdown, "**STALE**");
+  assertEquals(out.json.restoreProofsFresh, 0);
+  assertEquals(out.json.restoresProven, 1, "proven-ever was lost");
+  assertEquals(out.json.restoreProofMaxAgeDays, 30);
 });

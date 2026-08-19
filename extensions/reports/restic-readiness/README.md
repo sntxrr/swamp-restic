@@ -39,6 +39,7 @@ A repository table and a ranked findings list:
 | ------------------------ | -------- | ----------------------------------------------------- |
 | `restore-never-proven`   | critical | No successful restore on record                       |
 | `restore-failing`        | critical | The most recent restore drill failed                  |
+| `restore-proof-stale`    | high     | The last successful restore is older than 30 days     |
 | `check-failing`          | critical | `restic check` reported errors, or `--read-data` failed |
 | `repo-unreachable`       | high     | The scan failed, or restic could not open the repository |
 | `repo-stale`             | high     | Newest snapshot past the threshold, and not dormant   |
@@ -53,6 +54,22 @@ A repository table and a ranked findings list:
 
 On day one, `restore-never-proven` fires for **every** repository. That is the
 correct output, and it is the reason this exists.
+
+**A proof lapses.** `restore-never-proven` is gated on the record's absence, so
+without `restore-proof-stale` a single drill would buy a permanently clean
+report — the table printing `yes (400d ago)` while the summary said every
+repository had a proven restore. That is the same "clean means never
+re-examined" failure the rest of this report is built to prevent, and it is
+worse than day one, because day one at least said something.
+
+The limit is `RESTORE_PROOF_MAX_AGE_DAYS` = 30, sized for a fleet that backs up
+daily: after thirty days the repository has been rewritten roughly thirty times,
+so what was proven restorable is not what is stored now. A restore whose
+timestamp cannot be read counts as stale, never as fresh — the same fail-closed
+rule the `restore` method applies to an unmeasurable size.
+
+The headline and `restoreProofsFresh` count proofs **within** the limit;
+`restoresProven` still counts proofs ever, and is kept only for continuity.
 
 ## Honesty rules
 
