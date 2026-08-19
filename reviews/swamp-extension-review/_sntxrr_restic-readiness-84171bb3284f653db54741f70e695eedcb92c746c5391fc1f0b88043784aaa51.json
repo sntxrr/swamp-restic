@@ -1,0 +1,47 @@
+{
+  "extension": "@sntxrr/restic-readiness",
+  "version": "2026.08.19.1",
+  "reviewedAt": "2026-08-19T00:45:00Z",
+  "dimensions": [
+    {
+      "id": "credentials-secrets",
+      "verdict": "pass",
+      "note": "Unchanged surface: the report still holds no credentials and makes no authenticated call. The new code reads only `RungEvidence.ranAt`, a timestamp the model already wrote, and emits it as a day count. No new field is read from any resource, so no new value can reach the output. Re-audited the added strings: the finding detail and impact are static prose plus an integer age."
+    },
+    {
+      "id": "logging-quality",
+      "verdict": "pass",
+      "note": "Still emits no log lines, matching the prior review and @sntxrr/b2/fleet-hygiene. The markdown and JSON remain the user-visible record. The new state is legible in both: `**STALE**` in the table, a `restore-proof-stale` finding, and `restoreProofsFresh` / `restoreProofMaxAgeDays` in JSON."
+    },
+    {
+      "id": "error-handling",
+      "verdict": "pass",
+      "note": "Still never throws. The one new failure mode is an unparseable `ranAt`, and it is handled fail-closed: `daysSince` returns null and the null is treated as STALE, not fresh. This is deliberate and matches the restore method's rule that an unmeasurable size must never read as a safe size. Mutation-proven: changing `age === null ||` to `age !== null &&` fails the suite."
+    },
+    {
+      "id": "testing-completeness",
+      "verdict": "pass",
+      "note": "96 unit tests, exit status confirmed. Six new tests cover the added behaviour: stale fires; stale does not double-fire with never-proven; the boundary is asserted on BOTH sides (30d clean, 30.5d stale); an unreadable ranAt is stale for both null and a malformed string; a FAILING restore stays restore-failing rather than becoming stale; and the headline/table/JSON agree end to end. Three mutations were run and all three fail the suite: removing the fail-closed null branch, flipping the boundary to >=, and reverting the headline to proven-ever. Also fixed a latent time bomb found while writing these: the fixtures were aged against the wall clock, so every execute-path test would have begun emitting restore-proof-stale on a calendar date with no commit to blame. `now` is now injectable via context and pinned in the tests."
+    },
+    {
+      "id": "idempotency-resilience",
+      "verdict": "pass",
+      "note": "Still pure with respect to the world — writes nothing, mutates nothing, calls nothing. The report is now clock-dependent by design, which is the point of the feature, and the dependency is explicit: one `now`, read once per execution and threaded into both `analyze` and the table so a repository can never be called stale in the findings and fresh in the table on the same run."
+    },
+    {
+      "id": "api-contracts",
+      "verdict": "pass",
+      "note": "No HTTP calls. The `dataRepository.getContent` contract is unchanged. One output contract did change and is called out rather than slipped in: the markdown headline now counts proofs WITHIN the limit, so its number can fall without any repository regressing. `restoresProven` is preserved with its original meaning for continuity and `restoreProofsFresh` added alongside, so a JSON consumer gating on the old field keeps working and can migrate deliberately."
+    },
+    {
+      "id": "resource-management",
+      "verdict": "pass",
+      "note": "Holds no network connections, file handles or temporary files; the change adds no allocation beyond a filtered array per run. Nothing to close on any path, including error paths."
+    },
+    {
+      "id": "published-surface-hygiene",
+      "verdict": "pass",
+      "note": "Every added line re-audited against the live inventory: the new tests use the suite's placeholder `heron-debian` only, and the added README and source prose name no host, bucket, vault or repository. Verified by grepping the shipped-file list (manifest, .ts, README, LICENSE) for all 15 live repository names and their short host forms: zero hits. The `0d`/`400d` figures in the prose are illustrative."
+    }
+  ]
+}

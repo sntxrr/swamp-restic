@@ -1,7 +1,7 @@
 manifestVersion: 1
 
 name: "@sntxrr/restic-readiness"
-version: "2026.08.17.1"
+version: "2026.08.19.1"
 description: "Rank a restic fleet by what has actually been proven restorable. A workflow-scope report that joins every @sntxrr/restic/repository step in a run — freshness, structural check, read-data verification, canary dump and restore drill — into one ranked findings list, where a rung that has never run is itself a finding. Read-only: it reads what the steps already wrote and never touches a repository."
 repository: "https://github.com/sntxrr/swamp-restic"
 

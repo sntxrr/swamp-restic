@@ -18,7 +18,9 @@
  * this was built for had run `restic check` nightly for years and had never
  * once run `--read-data` or executed a single restore. A rung that has never
  * run is therefore a finding in its own right, and `restore-never-proven` is
- * expected to fire for every repository on day one.
+ * expected to fire for every repository on day one. A rung that ran ONCE and
+ * was never repeated is the same finding wearing a disguise, which is what
+ * `restore-proof-stale` exists to strip off.
  *
  * **Honesty rules, inherited from the B2 suite and sharpened here.**
  *
@@ -88,6 +90,25 @@ export type RungEvidence = {
   provenance: Provenance;
   detail: string | null;
 };
+
+/**
+ * How old a passing restore may be before it stops counting as proof.
+ *
+ * A proof does not fail, it LAPSES, and nothing about the repository changes on
+ * the day it does — which is why this needs a finding rather than a rendered
+ * age. Before this existed, `restore-never-proven` was gated purely on the
+ * record's absence, so a single drill produced a permanently clean report: the
+ * table printed `yes (400d ago)` and the summary still said every repository
+ * had a proven restore. That is the precise failure this report was written to
+ * prevent — a clean result meaning "never re-examined" rather than "healthy" —
+ * and it was worse than the state it replaced, because `restore-never-proven`
+ * at least said something.
+ *
+ * 30 days, for a fleet that backs up daily: the repository will have been
+ * rewritten roughly thirty times since the last proof, so nothing that was
+ * proven still is in any meaningful sense.
+ */
+export const RESTORE_PROOF_MAX_AGE_DAYS = 30;
 
 /** The stable instance name each rung writes, per CONVENTIONS §2. */
 const RUNG_INSTANCE: Record<string, string> = {
@@ -275,10 +296,11 @@ export type RepositoryState = {
  */
 export function analyze(
   repos: RepositoryState[],
-  opts: { standingRecordsReadable: boolean },
+  opts: { standingRecordsReadable: boolean; now?: number },
 ): { findings: Finding[]; dormantExcluded: string[] } {
   const findings: Finding[] = [];
   const dormantExcluded: string[] = [];
+  const now = opts.now ?? Date.now();
 
   for (const r of repos) {
     if (!r.scanned) {
@@ -489,6 +511,35 @@ export function analyze(
           "A restore was attempted and did not succeed. This is the strongest " +
           "possible signal that the backup cannot be relied on.",
       });
+    } else if (restore.passed) {
+      // A LAPSED proof. Deliberately not `critical`: unlike a never-proven or a
+      // failing repository, this one did restore once, so the evidence is old
+      // rather than absent or bad. It is still `high`, because the report's
+      // whole claim is about what is proven NOW.
+      //
+      // An unreadable `ranAt` counts as stale, not as fresh. The same
+      // fail-closed rule the restore method applies to an unmeasurable size:
+      // an age that cannot be established must never read as a safe age, or
+      // a malformed timestamp silently buys a permanent pass — which is the
+      // exact bug this finding exists to close.
+      const age = daysSince(restore.ranAt, now);
+      if (age === null || age > RESTORE_PROOF_MAX_AGE_DAYS) {
+        findings.push({
+          severity: "high",
+          code: "restore-proof-stale",
+          subject: r.name,
+          detail: age === null
+            ? "A restore succeeded, but its timestamp could not be read, so " +
+              "its age cannot be established."
+            : `The last successful restore was ${
+              age.toFixed(0)
+            } days ago, over the ${RESTORE_PROOF_MAX_AGE_DAYS}-day limit.`,
+          impact:
+            "The repository has been rewritten by every backup taken since, " +
+            "so what was proven restorable is not what is stored now. This " +
+            "repository is counted as unproven until the drill runs again.",
+        });
+      }
     }
 
     // --- version floor ---------------------------------------------------
@@ -612,7 +663,11 @@ export const report = {
       };
     }
 
-    const now = Date.now();
+    // Injectable so the tests can pin it. Without this the suite's fixtures are
+    // aged against the wall clock, and every one of them silently becomes a
+    // stale-proof case once real time passes RESTORE_PROOF_MAX_AGE_DAYS — a
+    // green suite today that fails on a date, with no commit to blame.
+    const now = typeof context.now === "number" ? context.now : Date.now();
     const states: RepositoryState[] = [];
     let standingReadAttempts = 0;
     let standingReadSuccesses = 0;
@@ -744,11 +799,25 @@ export const report = {
 
     const { findings, dormantExcluded } = analyze(states, {
       standingRecordsReadable,
+      now,
     });
 
     const scanned = states.filter((s) => s.scanned);
     const reachable = scanned.filter((s) => s.reachable === true);
     const proven = states.filter((s) => s.rungs["restore"]?.passed === true);
+    // Split proven-ever from proven-recently. The headline quotes the second:
+    // a report whose top line counts a 400-day-old drill as a proven restore is
+    // the thing `restore-proof-stale` exists to stop, and leaving the headline
+    // on `proven` would have kept saying it directly above the finding that
+    // contradicts it.
+    const isFreshProof = (s: RepositoryState): boolean => {
+      const r = s.rungs["restore"];
+      if (!r?.passed) return false;
+      const age = daysSince(r.ranAt, now);
+      return age !== null && age <= RESTORE_PROOF_MAX_AGE_DAYS;
+    };
+    const fresh = states.filter(isFreshProof);
+    const staleProofs = proven.length - fresh.length;
     const counts = Object.fromEntries(
       SEVERITY_ORDER.map((
         s,
@@ -758,8 +827,14 @@ export const report = {
     const lines: string[] = [
       "# restic fleet restore-readiness",
       "",
-      `**${proven.length} of ${states.length} repositories have a proven restore.**`,
+      `**${fresh.length} of ${states.length} repositories have a restore proven within the last ${RESTORE_PROOF_MAX_AGE_DAYS} days.**`,
       "",
+      ...(staleProofs > 0
+        ? [
+          `${staleProofs} more restored successfully at some point, but longer ago than that, and are not counted above.`,
+          "",
+        ]
+        : []),
       `Repositories examined: ${states.length} · scanned successfully: ${scanned.length} · reachable: ${reachable.length} · declared dormant: ${dormantExcluded.length}`,
       "",
     ];
@@ -799,9 +874,14 @@ export const report = {
         if (!r.passed) return "**FAILED**";
         const d = daysSince(r.ranAt, now);
         const when = d === null ? "date unknown" : `${d.toFixed(0)}d ago`;
-        return r.provenance === "standing-record"
-          ? `yes (${when}, prior run)`
-          : `yes (${when})`;
+        const origin = r.provenance === "standing-record"
+          ? `${when}, prior run`
+          : when;
+        // Bold "STALE" rather than "yes (400d ago)". The age was always
+        // printed; nobody reads a table looking for a number that has drifted.
+        return d === null || d > RESTORE_PROOF_MAX_AGE_DAYS
+          ? `**STALE** (${origin})`
+          : `yes (${origin})`;
       })();
       const readCell = (() => {
         const r = s.rungs["read-data"];
@@ -828,7 +908,7 @@ export const report = {
 
     if (findings.length === 0) {
       lines.push(
-        "No findings. Every examined repository is fresh, structurally sound, data-verified and has a proven restore.",
+        `No findings. Every examined repository is fresh, structurally sound, data-verified and has a restore proven within the last ${RESTORE_PROOF_MAX_AGE_DAYS} days.`,
         "",
       );
     } else {
@@ -842,6 +922,10 @@ export const report = {
         repositoriesScanned: scanned.length,
         repositoriesReachable: reachable.length,
         restoresProven: proven.length,
+        // `restoresProven` counts proofs that ever passed and is kept for
+        // continuity; `restoreProofsFresh` is the one a consumer should gate on.
+        restoreProofsFresh: fresh.length,
+        restoreProofMaxAgeDays: RESTORE_PROOF_MAX_AGE_DAYS,
         dormantExcluded,
         // Named so a consumer cannot mistake a partial assessment for a total.
         // Every one of these must be true before a clean result means the
