@@ -77,6 +77,23 @@ Records, among other things:
 An unreachable repository is **recorded, not thrown**: a thrown error writes no
 resource and a fleet report then cannot see the repository at all.
 
+#### A second backup set in the same repository: `excludeTags`
+
+When something else also backs up into the host's repository — an application
+pushing its pre-upgrade copy off-host, say — its snapshot is often the newest.
+Compared against `expectedPaths` it reads as scope drift, and its fresh
+timestamp would hide a host backup that had stopped. Tag that snapshot at the
+writer and exclude the tag here:
+
+```bash
+--global-arg 'excludeTags=["app-pre-upgrade"]'
+```
+
+Snapshots carrying any listed tag are never "latest" for freshness, scope drift
+or size, nor for the default snapshot of `dump` and `restore`. They stay in
+`snapshotCount` (`excludedSnapshotCount` says how many) and are never
+forgotten. A repository whose every snapshot is excluded is recorded `stale`.
+
 ### `check` — rung 2, and `verify` — rung 3
 
 ```bash
@@ -92,6 +109,17 @@ coverage, while the partition form covers the whole repository across a week.
 A lock conflict, cancellation or timeout is recorded as `inconclusive`, never as
 a failure — recording one as "check failed" reports a healthy repository as
 broken.
+
+A run that fails **only on transport errors** (`unexpected EOF`, a reset
+connection, a 5xx — the backend served a truncated read) is re-run **once**
+after `transportRetryDelaySeconds` (default 120), and the second result is
+recorded with `transportRetried: true`. It is deliberately *not* downgraded to
+`inconclusive`: a pack genuinely truncated in the bucket fails with the same
+`unexpected EOF`, but fails the retry too, and stays a failure. Any corruption
+signature (`ciphertext verification failed`, a hash mismatch) is never retried.
+
+Stored stderr is clipped to 2000 characters from **both ends**, because restic
+prints its retries first and the object that finally failed last.
 
 ### `dump` — rung 4
 

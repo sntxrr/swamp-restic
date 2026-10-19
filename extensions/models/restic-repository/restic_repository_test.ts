@@ -8,7 +8,9 @@ import { z } from "npm:zod@4";
 import {
   ageHours,
   classifyFailure,
+  clipDetail,
   isInconclusive,
+  isTransportOnly,
   lastMessageOfType,
   missingPaths,
   model,
@@ -590,6 +592,100 @@ Deno.test("scan accepts a snapshot with no tags, summary or program_version", as
   }
 });
 
+// A host backup plus a second backup set in the same repository: an
+// application's pre-upgrade copy, newer than the host run and one file wide.
+const SHARED_REPO_FIXTURE = JSON.stringify([
+  {
+    time: "2026-10-19T04:00:15Z",
+    paths: ["/etc", "/root", "/var/lib/docker"],
+    hostname: "heron",
+    username: "root",
+    id: "5".repeat(64),
+    short_id: "55555555",
+  },
+  {
+    time: "2026-10-19T11:14:57Z",
+    paths: ["/home/ops/backups/app/app_backup_20261019.tar.gz"],
+    hostname: "heron",
+    username: "root",
+    tags: ["app-pre-upgrade"],
+    id: "6".repeat(64),
+    short_id: "66666666",
+  },
+]);
+
+const HOST_PATHS = ["/etc", "/root", "/var/lib/docker"];
+
+Deno.test("without excludeTags a tagged one-file snapshot is the latest — the drift this option exists for", async () => {
+  const fake = await fakeRestic(scanScript(SHARED_REPO_FIXTURE));
+  const { context, written } = makeContext(
+    globalsFor(fake.path, { expectedPaths: HOST_PATHS }),
+  );
+  try {
+    await methods.scan.execute({}, context);
+    assertEquals(written[0].data.latestSnapshotId, "66666666");
+    assertEquals(written[0].data.scopeDrift, true);
+    assertEquals(written[0].data.excludedSnapshotCount, 0);
+  } finally {
+    fake.cleanup();
+  }
+});
+
+Deno.test("excludeTags keeps a second backup set from standing in for the host backup", async () => {
+  // Log every argv so the stats call can be checked too.
+  const fake = await fakeRestic(
+    'echo "$@" >> "$0.argv"\n' + scanScript(SHARED_REPO_FIXTURE),
+  );
+  const { context, written } = makeContext(
+    globalsFor(fake.path, {
+      expectedPaths: HOST_PATHS,
+      excludeTags: ["app-pre-upgrade"],
+    }),
+  );
+  try {
+    await methods.scan.execute({}, context);
+    const data = written[0].data;
+    assertEquals(data.latestSnapshotId, "55555555");
+    assertEquals(data.latestPaths, HOST_PATHS);
+    assertEquals(data.missingPaths, []);
+    assertEquals(data.scopeDrift, false);
+    assertEquals(data.latestSnapshotTime, "2026-10-19T04:00:15Z");
+    // Excluded, never hidden: still counted.
+    assertEquals(data.snapshotCount, 2);
+    assertEquals(data.excludedSnapshotCount, 1);
+    assertEquals(data.excludeTags, ["app-pre-upgrade"]);
+
+    // Size describes the host snapshot: `stats latest` would be the tarball.
+    const argv = await Deno.readTextFile(`${fake.path}.argv`);
+    assertStringIncludes(argv, `stats ${"5".repeat(64)} --mode raw-data`);
+    assert(!/stats latest/.test(argv), "stats must not use restic's latest");
+  } finally {
+    fake.cleanup();
+  }
+});
+
+Deno.test("a repository whose every snapshot is excluded is stale, not empty", async () => {
+  // A fresh pre-upgrade copy must never mask a host backup that stopped.
+  const onlyTagged = JSON.stringify([JSON.parse(SHARED_REPO_FIXTURE)[1]]);
+  const fake = await fakeRestic(scanScript(onlyTagged));
+  const { context, written } = makeContext(
+    globalsFor(fake.path, {
+      expectedPaths: HOST_PATHS,
+      excludeTags: ["app-pre-upgrade"],
+    }),
+  );
+  try {
+    await methods.scan.execute({}, context);
+    const data = written[0].data;
+    assertEquals(data.latestSnapshotId, null);
+    assertEquals(data.stale, true);
+    assertEquals(data.scopeDrift, true);
+    assertEquals(data.excludedSnapshotCount, 1);
+  } finally {
+    fake.cleanup();
+  }
+});
+
 // ---------------------------------------------------------------------------
 // check / verify
 // ---------------------------------------------------------------------------
@@ -662,6 +758,106 @@ Deno.test("a locked repository is recorded inconclusive and does NOT throw", asy
   } finally {
     fake.cleanup();
   }
+});
+
+// The live stderr shape of the 2026-10-18 B2 read blip.
+const EOF_STDERR =
+  '{"message_type":"error","message":"Load(\\u003csnapshot/9f2a5f0aa2\\u003e, 0, 0) ' +
+  'returned error, retrying after 1.231321907s: Copy: unexpected EOF"}';
+const ERRORS_SUMMARY = '{"message_type":"summary","num_errors":1,' +
+  '"broken_packs":null,"suggest_repair_index":false,"suggest_prune":false}';
+
+/** A fake restic that fails its first check and runs `then` afterwards. */
+function failsOnceThen(firstStderr: string, then: string): string {
+  return 'n=$(cat "$0.n" 2>/dev/null || echo 0); echo $((n+1)) > "$0.n"\n' +
+    'if [ "$n" -eq 0 ]; then\n' +
+    `  echo '${ERRORS_SUMMARY}'; echo '${firstStderr}' >&2; exit 1\n` +
+    `fi\n${then}`;
+}
+
+Deno.test("isTransportOnly: an EOF is transport, a hash mismatch never is", () => {
+  assert(isTransportOnly(result({ code: 1, stderr: EOF_STDERR })));
+  assert(
+    !isTransportOnly(result({
+      code: 1,
+      stderr: EOF_STDERR + "\npack 1a2b: ciphertext verification failed",
+    })),
+  );
+  assert(!isTransportOnly(result({ code: 1, stderr: "pack 1a2b broken" })));
+  assert(!isTransportOnly(result({ code: 0, stderr: EOF_STDERR })));
+});
+
+Deno.test("a check that failed on a transport blip is re-run once and records the pass", async () => {
+  const fake = await fakeRestic(
+    failsOnceThen(EOF_STDERR, `echo '${CLEAN_CHECK}'`),
+  );
+  const { context, written } = makeContext(
+    globalsFor(fake.path, { transportRetryDelaySeconds: 0 }),
+  );
+  try {
+    await methods.verify.execute({}, context);
+    assertEquals(await Deno.readTextFile(`${fake.path}.n`), "2\n");
+    const data = written[0].data;
+    assertEquals(data.passed, true);
+    assertEquals(data.transportRetried, true);
+    // The blip is kept as evidence even though the rung passed.
+    assertStringIncludes(String(data.detail), "passed on retry");
+    assertStringIncludes(String(data.detail), "unexpected EOF");
+  } finally {
+    fake.cleanup();
+  }
+});
+
+Deno.test("a persistent EOF fails the retry too and is recorded as the failure it is", async () => {
+  // A pack truncated in the bucket fails exactly like a blip — but every time.
+  const fake = await fakeRestic(
+    failsOnceThen(
+      EOF_STDERR,
+      `echo '${ERRORS_SUMMARY}'; echo '${EOF_STDERR}' >&2; exit 1`,
+    ),
+  );
+  const { context, written } = makeContext(
+    globalsFor(fake.path, { transportRetryDelaySeconds: 0 }),
+  );
+  try {
+    await assertRejects(() => methods.verify.execute({}, context), Error);
+    assertEquals(await Deno.readTextFile(`${fake.path}.n`), "2\n");
+    const data = written[0].data;
+    assertEquals(data.passed, false);
+    assertEquals(data.inconclusive, false);
+    assertEquals(data.failureReason, "errors-found");
+    assertEquals(data.transportRetried, true);
+  } finally {
+    fake.cleanup();
+  }
+});
+
+Deno.test("corruption is never retried", async () => {
+  const fake = await fakeRestic(
+    failsOnceThen("pack 1a2b: ciphertext verification failed", `echo '${CLEAN_CHECK}'`),
+  );
+  const { context, written } = makeContext(
+    globalsFor(fake.path, { transportRetryDelaySeconds: 0 }),
+  );
+  try {
+    await assertRejects(() => methods.verify.execute({}, context), Error);
+    assertEquals(await Deno.readTextFile(`${fake.path}.n`), "1\n");
+    assertEquals(written[0].data.passed, false);
+    assertEquals(written[0].data.transportRetried, false);
+  } finally {
+    fake.cleanup();
+  }
+});
+
+Deno.test("clipDetail keeps the END of stderr, where restic prints its verdict", () => {
+  const retries = "retrying after 1s: unexpected EOF\n".repeat(200);
+  const clipped = clipDetail(retries + "Fatal: repository contains errors") ?? "";
+  assert(clipped.length <= 2000, `clipped to ${clipped.length}`);
+  assert(clipped.startsWith("retrying after"));
+  assert(clipped.endsWith("Fatal: repository contains errors"));
+  assertStringIncludes(clipped, "chars elided");
+  assertEquals(clipDetail(""), null);
+  assertEquals(clipDetail("short"), "short");
 });
 
 // ---------------------------------------------------------------------------
@@ -817,6 +1013,78 @@ Deno.test("restore records restic's item count, not a regular-file count", async
     assertEquals(written[0].data.bytesRestored, 254231900);
     assertEquals(written[0].data.verified, true);
     assertEquals(written[0].data.passed, true);
+  } finally {
+    fake.cleanup();
+  }
+});
+
+Deno.test("with excludeTags, dump and restore default to the host snapshot, not restic's latest", async () => {
+  // restic's `latest` ignores excludeTags: on an upgrade day it would drill
+  // the pre-upgrade tarball, which never contained /etc.
+  const host = "5".repeat(64);
+  const fake = await fakeRestic(
+    'echo "$@" >> "$0.argv"\n' +
+      'case "$1" in\n' +
+      `  snapshots) cat <<'EOF'\n${SHARED_REPO_FIXTURE}\nEOF\n  ;;\n` +
+      `  restore) printf '%s\\n' '${RESTORE_OK}' ;;\n` +
+      '  dump) printf "heron" ;;\n' +
+      "esac",
+  );
+  try {
+    const globals = globalsFor(fake.path, { excludeTags: ["app-pre-upgrade"] });
+    await methods.dump.execute(
+      { path: "/etc/hostname" },
+      makeContext(globals).context,
+    );
+    await methods.restore.execute(
+      { path: "/etc", target: "/tmp/drill", maxRestoreBytes: 1e9 },
+      makeContext(globals).context,
+    );
+    const argv = await Deno.readTextFile(`${fake.path}.argv`);
+    assertStringIncludes(argv, `dump ${host} /etc/hostname`);
+    assertStringIncludes(argv, `restore ${host}:/etc`);
+    assert(!/(dump|restore) latest/.test(argv), argv);
+  } finally {
+    fake.cleanup();
+  }
+});
+
+Deno.test("an explicit snapshot wins over excludeTags and lists nothing", async () => {
+  const fake = await fakeRestic('echo "$@" >> "$0.argv"; printf "heron"');
+  try {
+    await methods.dump.execute(
+      { path: "/etc/hostname", snapshot: "abcdef12" },
+      makeContext(globalsFor(fake.path, { excludeTags: ["app-pre-upgrade"] }))
+        .context,
+    );
+    const argv = await Deno.readTextFile(`${fake.path}.argv`);
+    assertEquals(argv.trim(), "dump abcdef12 /etc/hostname --no-lock");
+  } finally {
+    fake.cleanup();
+  }
+});
+
+Deno.test("a restore with nothing but excluded snapshots is RECORDED as failed", async () => {
+  const onlyTagged = JSON.stringify([JSON.parse(SHARED_REPO_FIXTURE)[1]]);
+  const fake = await fakeRestic(
+    `case "$1" in\n  snapshots) cat <<'EOF'\n${onlyTagged}\nEOF\n  ;;\nesac`,
+  );
+  const { context, written } = makeContext(
+    globalsFor(fake.path, { excludeTags: ["app-pre-upgrade"] }),
+  );
+  try {
+    await assertRejects(
+      () =>
+        methods.restore.execute(
+          { path: "/etc", target: "/tmp/drill", maxRestoreBytes: 1e9 },
+          context,
+        ),
+      Error,
+    );
+    assertEquals(written.length, 1);
+    assertEquals(written[0].instance, "validation-restore");
+    assertEquals(written[0].data.passed, false);
+    assertEquals(written[0].data.failureReason, "no-candidate-snapshot");
   } finally {
     fake.cleanup();
   }
