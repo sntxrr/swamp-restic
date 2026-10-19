@@ -1,0 +1,82 @@
+{
+  "extension": "@sntxrr/restic-repository",
+  "version": "2026.10.19.1",
+  "reviewedAt": "2026-10-19T21:38:50Z",
+  "dimensions": [
+    {
+      "id": "credentials-secrets",
+      "verdict": "pass",
+      "note": "No credential surface changed. chooseSnapshot and the transport retry call runRestic, so credentials still travel only in the clearEnv environment and stderr is redacted before clipDetail sees it; the existing 'no credential reaches a written resource' test still runs over every write path. excludeTags and transportRetryDelaySeconds are non-sensitive."
+    },
+    {
+      "id": "logging-quality",
+      "verdict": "pass",
+      "note": "The retry logs a warn naming the rung and the delay before it sleeps, and the completion line says 'after a transport-error retry' when one happened. Interpolated messages match the rest of this file; nothing sensitive is logged."
+    },
+    {
+      "id": "error-handling",
+      "verdict": "pass",
+      "note": "Keeps the file's deliberate write-then-throw: failUnchosen RECORDS a dump/restore that could not choose a snapshot (failureReason from classifyFailure, or no-candidate-snapshot) and then throws, so the readiness report sees the failure instead of a stale prior pass. The transport retry is deliberately NOT a downgrade to inconclusive: an inconclusive read-data raises no readiness finding, and a pack truncated in the bucket fails with the same 'unexpected EOF' as a blip, so downgrading would hide real damage. One retry only; a persistent EOF is recorded errors-found. Any corruption signature vetoes the retry."
+    },
+    {
+      "id": "testing-completeness",
+      "verdict": "pass",
+      "note": "71 tests, exit status 0 checked (deno test -A). 12 new: excludeTags on/off, stats by id, all-excluded => stale, dump+restore default to the host snapshot, explicit snapshot wins, unresolvable snapshot recorded, transport blip retried to a pass, persistent EOF still fails, corruption never retried, clipDetail keeps the tail. Seven mutations (each new guard deleted in turn) all fail the suite. Live smoke on a real 24-snapshot repository: 12 tagged snapshots excluded, latest became the host snapshot with all expected paths, scopeDrift false, size 51.6 GB instead of the tarball's 2.5 MB; dump of /etc/hostname resolved to the host snapshot and passed."
+    },
+    {
+      "id": "idempotency-resilience",
+      "verdict": "pass",
+      "note": "Still read-only: chooseSnapshot runs only `snapshots --json`, under the --no-lock injection. The retry re-runs the same read-only check once; worst case doubles a check's wall time (bounded by timeoutMinutes per invocation plus the delay)."
+    },
+    {
+      "id": "api-contracts",
+      "verdict": "pass",
+      "note": "restic's snapshots JSON is parsed with the existing permissive SnapshotSchema (tags optional, absent when empty). Transport/corruption signatures were taken from live stderr (2026-10-18 B2 blip: Load(<snapshot/...>) ... Copy: unexpected EOF) and restic's corruption messages."
+    },
+    {
+      "id": "resource-management",
+      "verdict": "pass",
+      "note": "No new handles or temp files. The retry delay is a plain timer that resolves; the fake-restic counter files in tests live in the per-test temp dir that cleanup removes."
+    },
+    {
+      "id": "published-surface-hygiene",
+      "verdict": "pass",
+      "note": "Added lines grepped for internal host, repository, vault and network names: 0 hits. Fixtures use the suite's placeholder host heron and a generic tag app-pre-upgrade; snapshot ids in the EOF fixture are random restic ids. The pre-push denylist hook is the second gate."
+    },
+    {
+      "id": "schema-strictness",
+      "verdict": "pass",
+      "note": "RepositorySchema gains excludeTags and excludedSnapshotCount, ValidationSchema gains transportRetried (nullable: null for rungs that never retry). Plain z.object, no passthrough; the test harness validates every write against them."
+    },
+    {
+      "id": "lifetime-gc",
+      "verdict": "pass",
+      "note": "No new spec; existing lifetime/garbageCollection unchanged."
+    },
+    {
+      "id": "crud-completeness",
+      "verdict": "pass",
+      "note": "Unchanged scope: a read-only validator; the write path belongs to the host's backup role."
+    },
+    {
+      "id": "preflight-checks",
+      "verdict": "pass",
+      "note": "No new check. excludeTags is model configuration; an empty or absent list keeps the old behaviour exactly (restic's latest)."
+    },
+    {
+      "id": "instance-names",
+      "verdict": "pass",
+      "note": "No new instance names. failUnchosen writes validation-<rung>, the same instance the rung writes on any other outcome."
+    },
+    {
+      "id": "data-access",
+      "verdict": "pass",
+      "note": "No dataRepository access; snapshot choice is derived live from the repository."
+    },
+    {
+      "id": "version-upgrades",
+      "verdict": "pass",
+      "note": "Behavior version deliberately left at 2026.08.07.2: only OPTIONAL global arguments were added, so every existing definition validates unchanged and needs no migration; new output fields only appear in new data. Bumping the type version would make swamp rewrite stored definitions on the consumer for no schema reason. The 'no upgrades array' push warning predates this change."
+    }
+  ]
+}

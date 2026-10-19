@@ -216,6 +216,50 @@ export function isInconclusive(result: ResticResult): boolean {
     );
 }
 
+/**
+ * Signatures of a transport failure: the backend served a truncated or failed
+ * read. B2's S3 endpoint does this in bursts (measured twice, 2026-09-20 and
+ * 2026-10-18), and restic reports the object it was reading at the time as an
+ * error even though the object itself is intact.
+ */
+const TRANSPORT_ERROR =
+  /unexpected EOF|connection reset by peer|broken pipe|i\/o timeout|TLS handshake timeout|context deadline exceeded|50[234] (?:Bad Gateway|Service Unavailable|Gateway Time-?out)|ServiceUnavailable|SlowDown/i;
+
+/** Signatures restic only prints when stored content is actually wrong. */
+const CORRUPTION_ERROR =
+  /ciphertext verification failed|does not match|hash mismatch|invalid (?:blob|pack|header|data)|damaged|unexpected (?:blob|pack) type/i;
+
+/**
+ * Did this failed check fail only on transport errors?
+ *
+ * Deliberately NOT a reason to record the run as inconclusive. A pack that is
+ * genuinely truncated in the bucket fails with the same `unexpected EOF` as a
+ * transient blip, and an inconclusive read-data result raises no finding in
+ * the readiness report — so downgrading would hide real damage for good. The
+ * only thing this licenses is ONE retry: a blip clears on the second attempt,
+ * real damage fails it again and is recorded as the failure it is.
+ */
+export function isTransportOnly(result: ResticResult): boolean {
+  if (result.code === RESTIC_EXIT.OK || result.timedOut) return false;
+  return TRANSPORT_ERROR.test(result.stderr) &&
+    !CORRUPTION_ERROR.test(result.stderr);
+}
+
+/**
+ * Bound stderr for a resource, keeping BOTH ends.
+ *
+ * restic prints its retries first and its verdict last, so a head-only cut
+ * keeps a page of `retrying after …` lines and drops the line that says which
+ * object finally failed — exactly what a diagnosis needs.
+ */
+export function clipDetail(text: string, max = 2000): string | null {
+  if (text.length === 0) return null;
+  if (text.length <= max) return text;
+  const marker = `\n… [${text.length - max} chars elided] …\n`;
+  const half = Math.floor((max - marker.length) / 2);
+  return text.slice(0, half) + marker + text.slice(text.length - half);
+}
+
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
@@ -412,6 +456,13 @@ const RepositorySchema = z.object({
   hostnames: z.array(z.string()),
   hostnameDrift: z.boolean(),
 
+  /**
+   * Tags whose snapshots are not candidates for "latest". They are still
+   * counted in `snapshotCount`; `excludedSnapshotCount` says how many.
+   */
+  excludeTags: z.array(z.string()),
+  excludedSnapshotCount: z.number(),
+
   /** Paths in the LATEST snapshot — what a restore today would yield. */
   latestPaths: z.array(z.string()),
   expectedPaths: z.array(z.string()),
@@ -455,6 +506,8 @@ const ValidationSchema = z.object({
   suggestRepairIndex: z.boolean().nullable(),
   suggestPrune: z.boolean().nullable(),
   readDataSubset: z.string().nullable(),
+  /** True when the first attempt failed on transport errors only and was re-run. */
+  transportRetried: z.boolean().nullable(),
 
   /** dump */
   canaryPath: z.string().nullable(),
@@ -532,6 +585,17 @@ const GlobalArgsSchema = z.object({
     "Paths this repository is expected to contain. Compared against the " +
       "LATEST snapshot to detect backup-scope drift.",
   ),
+  excludeTags: z.array(z.string()).optional().describe(
+    "Snapshots carrying any of these tags are never treated as the latest " +
+      "snapshot — for a second backup set sharing the repository, such as " +
+      "an application's pre-upgrade copy. Freshness, scope drift and size " +
+      "then describe the host backup alone. Excluded snapshots are still " +
+      "counted, and never forgotten.",
+  ),
+  transportRetryDelaySeconds: z.number().optional().describe(
+    "Wait before the single re-run of a check that failed only on " +
+      "transport errors (a truncated read from the backend). Default 120.",
+  ),
   dormant: z.boolean().optional().describe(
     "Declare this repository deliberately inactive (host powered off or " +
       "decommissioned). Excluded from staleness, always still counted.",
@@ -576,7 +640,10 @@ const DumpArgsSchema = z.object({
   path: z.string().describe(
     "Absolute path of the canary file inside the snapshot.",
   ),
-  snapshot: z.string().optional().describe("Snapshot ID. Default 'latest'."),
+  snapshot: z.string().optional().describe(
+    "Snapshot ID. Default: the newest snapshot not carrying an excludeTags " +
+      "tag ('latest' when excludeTags is unset).",
+  ),
   expectedSha256: z.string().optional().describe(
     "If given, the dump fails unless the content hash matches.",
   ),
@@ -589,7 +656,10 @@ const RestoreArgsSchema = z.object({
   target: z.string().describe(
     "Local directory to restore into. Contents are overwritten.",
   ),
-  snapshot: z.string().optional().describe("Snapshot ID. Default 'latest'."),
+  snapshot: z.string().optional().describe(
+    "Snapshot ID. Default: the newest snapshot not carrying an excludeTags " +
+      "tag ('latest' when excludeTags is unset).",
+  ),
   maxRestoreBytes: z.number().optional().describe(
     "Override the byte ceiling for this run only.",
   ),
@@ -657,6 +727,7 @@ async function writeValidation(
       suggestRepairIndex: null,
       suggestPrune: null,
       readDataSubset: null,
+      transportRetried: null,
       canaryPath: null,
       canaryBytes: null,
       canarySha256: null,
@@ -669,6 +740,84 @@ async function writeValidation(
       maxRestoreBytes: null,
       ...record,
     },
+  );
+}
+
+type SnapshotChoice =
+  | { snapshot: string }
+  | { failureReason: string; detail: string | null; exitCode: number };
+
+/**
+ * The snapshot a dump or restore reads when the caller names none.
+ *
+ * restic's own `latest` knows nothing of excludeTags, so with exclusions set
+ * it would drill an application's pre-upgrade copy instead of the host backup
+ * — a restore of /etc from a snapshot that never contained it.
+ */
+async function chooseSnapshot(
+  g: GlobalArgs,
+  explicit: string | undefined,
+): Promise<SnapshotChoice> {
+  if (explicit !== undefined) return { snapshot: explicit };
+  const excluded = new Set(g.excludeTags ?? []);
+  if (excluded.size === 0) return { snapshot: "latest" };
+
+  const run = await runRestic(
+    credentialsOf(g),
+    ["snapshots", "--json"],
+    runOptionsOf(g),
+  );
+  if (run.code !== RESTIC_EXIT.OK) {
+    return {
+      failureReason: classifyFailure(run),
+      detail: clipDetail(run.stderr),
+      exitCode: run.code,
+    };
+  }
+  const parsed = z.array(SnapshotSchema).safeParse(
+    JSON.parse(run.stdout || "[]"),
+  );
+  if (!parsed.success) {
+    return {
+      failureReason: "error",
+      detail: `restic snapshots returned an unexpected shape: ` +
+        parsed.error.message,
+      exitCode: run.code,
+    };
+  }
+  const newest = parsed.data
+    .filter((s) => !(s.tags ?? []).some((t) => excluded.has(t)))
+    .sort((a, b) => Date.parse(a.time) - Date.parse(b.time))
+    .pop();
+  return newest ? { snapshot: newest.id } : {
+    failureReason: "no-candidate-snapshot",
+    detail: "every snapshot carries an excluded tag",
+    exitCode: run.code,
+  };
+}
+
+/** Record a dump or restore that could not choose its snapshot, then throw. */
+async function failUnchosen(
+  context: ExecuteContext<GlobalArgs>,
+  rung: "dump" | "restore",
+  ranAt: string,
+  choice: Exclude<SnapshotChoice, { snapshot: string }>,
+): Promise<never> {
+  const name = repositoryName(context.globalArgs.repository);
+  await writeValidation(context, {
+    repositoryName: name,
+    rung,
+    passed: false,
+    inconclusive: false,
+    failureReason: choice.failureReason,
+    detail: choice.detail,
+    exitCode: choice.exitCode,
+    ranAt,
+    durationMs: 0,
+  });
+  throw new Error(
+    `${name}: could not choose a snapshot for ${rung} ` +
+      `(${choice.failureReason}): ${choice.detail ?? ""}`,
   );
 }
 
@@ -685,7 +834,19 @@ async function runCheck(
   const args = ["check", "--json"];
   if (subset !== null) args.push(`--read-data-subset=${subset}`);
 
-  const run = await runRestic(credentialsOf(g), args, runOptionsOf(g));
+  const started = Date.now();
+  let run = await runRestic(credentialsOf(g), args, runOptionsOf(g));
+  let firstAttempt: ResticResult | null = null;
+  if (!isInconclusive(run) && isTransportOnly(run)) {
+    const delaySeconds = g.transportRetryDelaySeconds ?? 120;
+    context.logger.warn(
+      `${name}: ${rung} failed on transport errors only; re-running once ` +
+        `in ${delaySeconds}s`,
+    );
+    await new Promise((resolve) => setTimeout(resolve, delaySeconds * 1000));
+    firstAttempt = run;
+    run = await runRestic(credentialsOf(g), args, runOptionsOf(g));
+  }
   const summary = lastMessageOfType(parseJsonLines(run.stdout), "summary");
 
   // `broken_packs` is null on a clean repository, NOT []. Typing it as an
@@ -712,10 +873,16 @@ async function runCheck(
       : (numErrors ?? 0) > 0
       ? "errors-found"
       : classifyFailure(run),
-    detail: passed ? null : run.stderr.slice(0, 2000) || null,
+    // A pass after a retry keeps the first attempt's errors: the blip is
+    // evidence worth having, and it is the only trace the retry leaves.
+    detail: !passed ? clipDetail(run.stderr) : firstAttempt
+      ? clipDetail(
+        `passed on retry; first attempt failed with: ${firstAttempt.stderr}`,
+      )
+      : null,
     exitCode: run.code,
     ranAt,
-    durationMs: run.durationMs,
+    durationMs: Date.now() - started,
     numErrors,
     brokenPacks,
     suggestRepairIndex: typeof summary?.suggest_repair_index === "boolean"
@@ -725,14 +892,15 @@ async function runCheck(
       ? summary.suggest_prune
       : null,
     readDataSubset: subset,
+    transportRetried: firstAttempt !== null,
   });
 
   context.logger.info(
     `${name}: ${rung} ${
       passed ? "passed" : inconclusive ? "inconclusive" : "FAILED"
-    }${subset ? ` (subset ${subset})` : ""} in ${
-      (run.durationMs / 1000).toFixed(1)
-    }s`,
+    }${subset ? ` (subset ${subset})` : ""}${
+      firstAttempt ? " after a transport-error retry" : ""
+    } in ${((Date.now() - started) / 1000).toFixed(1)}s`,
   );
 
   if (!passed && !inconclusive) {
@@ -876,6 +1044,7 @@ export const model = {
         const dormant = g.dormant ?? false;
         const maxStaleDays = g.maxStaleDays ?? 2;
         const expectedPaths = g.expectedPaths ?? [];
+        const excludeTags = g.excludeTags ?? [];
 
         const snapshotsRun = await runRestic(
           creds,
@@ -894,7 +1063,7 @@ export const model = {
             repositoryName: name,
             reachable: false,
             failureReason: reason,
-            failureDetail: snapshotsRun.stderr.slice(0, 2000) || null,
+            failureDetail: clipDetail(snapshotsRun.stderr),
             dormant,
             snapshotCount: 0,
             latestSnapshotId: null,
@@ -904,6 +1073,8 @@ export const model = {
             maxStaleDays,
             hostnames: [],
             hostnameDrift: false,
+            excludeTags,
+            excludedSnapshotCount: 0,
             latestPaths: [],
             expectedPaths,
             missingPaths: expectedPaths,
@@ -934,7 +1105,18 @@ export const model = {
         const sorted = [...parsedList.data].sort((a, b) =>
           Date.parse(a.time) - Date.parse(b.time)
         );
-        const latest = sorted.length > 0 ? sorted[sorted.length - 1] : null;
+        // A second backup set sharing the repository (an application's
+        // pre-upgrade copy, say) must not stand in for the host backup:
+        // compared against expectedPaths it reads as scope drift, and — worse
+        // — its fresh timestamp would hide a host backup that had stopped.
+        const excluded = new Set(excludeTags);
+        const candidates = sorted.filter((s) =>
+          !(s.tags ?? []).some((t) => excluded.has(t))
+        );
+        const excludedSnapshotCount = sorted.length - candidates.length;
+        const latest = candidates.length > 0
+          ? candidates[candidates.length - 1]
+          : null;
 
         const hostnames = Array.from(
           new Set(
@@ -956,7 +1138,12 @@ export const model = {
         const age = ageHours(latest?.time ?? null, Date.now());
 
         // A dormant repository is never stale — but it is always counted.
-        const stale = !dormant && age !== null && age > maxStaleDays * 24;
+        // Snapshots that are ALL excluded mean the host backup is absent,
+        // which is staleness, not an empty repository.
+        const stale = !dormant &&
+          (age !== null
+            ? age > maxStaleDays * 24
+            : latest === null && excludedSnapshotCount > 0);
 
         // Size and format are best-effort: a repository with no snapshots has
         // no `latest` to stat, and neither call should sink the scan.
@@ -983,9 +1170,10 @@ export const model = {
         }
 
         if (latest) {
+          // By id, not `latest`: restic's `latest` ignores excludeTags.
           const statsRun = await runRestic(
             creds,
-            ["stats", "latest", "--mode", "raw-data", "--json"],
+            ["stats", latest.id, "--mode", "raw-data", "--json"],
             opts,
           );
           if (statsRun.code === RESTIC_EXIT.OK) {
@@ -1020,6 +1208,8 @@ export const model = {
             maxStaleDays,
             hostnames,
             hostnameDrift: hostnames.length > 1,
+            excludeTags,
+            excludedSnapshotCount,
             latestPaths,
             expectedPaths,
             missingPaths: missing,
@@ -1108,8 +1298,12 @@ export const model = {
       ): Promise<Handles> => {
         const g = context.globalArgs;
         const name = repositoryName(g.repository);
-        const snapshot = args.snapshot ?? "latest";
         const ranAt = new Date().toISOString();
+        const choice = await chooseSnapshot(g, args.snapshot);
+        if (!("snapshot" in choice)) {
+          return await failUnchosen(context, "dump", ranAt, choice);
+        }
+        const snapshot = choice.snapshot;
 
         // `dump` writes raw bytes and must never be passed --json.
         const run = await runRestic(
@@ -1138,7 +1332,7 @@ export const model = {
             : mismatch
             ? "canary-hash-mismatch"
             : classifyFailure(run),
-          detail: passed ? null : run.stderr.slice(0, 2000) || null,
+          detail: passed ? null : clipDetail(run.stderr),
           exitCode: run.code,
           ranAt,
           durationMs: run.durationMs,
@@ -1182,9 +1376,13 @@ export const model = {
         const creds = credentialsOf(g);
         const opts = runOptionsOf(g);
         const name = repositoryName(g.repository);
-        const snapshot = args.snapshot ?? "latest";
-        const selector = `${snapshot}:${args.path}`;
         const ranAt = new Date().toISOString();
+        const choice = await chooseSnapshot(g, args.snapshot);
+        if (!("snapshot" in choice)) {
+          return await failUnchosen(context, "restore", ranAt, choice);
+        }
+        const snapshot = choice.snapshot;
+        const selector = `${snapshot}:${args.path}`;
         // The ceiling is a method input OR a global argument, resolved here in
         // execute. It is deliberately NOT a pre-flight check: checks never
         // receive method inputs, so a check would reject the per-run override
@@ -1282,7 +1480,7 @@ export const model = {
           passed: ok,
           inconclusive: !ok && isInconclusive(run),
           failureReason: ok ? null : classifyFailure(run),
-          detail: ok ? null : run.stderr.slice(0, 2000) || null,
+          detail: ok ? null : clipDetail(run.stderr),
           exitCode: run.code,
           ranAt,
           durationMs: run.durationMs,
@@ -1357,7 +1555,7 @@ export const model = {
           locksRemoved: removed,
           countReported: removed !== null,
           failureReason: ok ? null : classifyFailure(run),
-          detail: ok ? null : run.stderr.slice(0, 2000) || null,
+          detail: ok ? null : clipDetail(run.stderr),
           exitCode: run.code,
           ranAt,
           durationMs: run.durationMs,
