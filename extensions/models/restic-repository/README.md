@@ -153,6 +153,13 @@ must never read as a safe one. Raise it **per run** with
 `itemsRestored` is restic's own count and includes directories and symlinks — it
 is not a count of regular files on disk.
 
+`path` may also name a **single file**. restic accepts only a directory after
+`<snapshot>:`, and refuses a file with `not a directory`; on that refusal the
+rung restores the file's parent narrowed by an anchored `--include /<name>`
+(glob characters escaped), so the file lands at `<target>/<name>` and nothing
+else in the parent comes with it. The parent+include dry run goes through the
+same fail-closed ceiling, and must match exactly one file.
+
 ### `unlock` — the one permitted mutation
 
 ```bash
@@ -220,6 +227,13 @@ never argv, which is world-readable via `ps`. The runner refuses to execute if a
 credential appears in the argument list, builds the child environment with
 `clearEnv` so nothing else leaks in, and redacts credentials out of captured
 stderr before it can reach a resource snapshot.
+
+restic is spawned with `Deno.Command` and no shell, so each input is one argv
+element and cannot be split or expanded. The positional inputs restic could
+mistake for an option — an explicit `snapshot`, and `dump`'s `path` — are
+refused if they begin with `-`; every other input is either prefixed
+(`<snapshot>:<path>`, `--include /<name>`) or the value of a flag
+(`--target <dir>`).
 
 ## Set `cacheDir`
 

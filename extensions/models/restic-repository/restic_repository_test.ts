@@ -7,9 +7,14 @@ import {
 import { z } from "npm:zod@4";
 import {
   ageHours,
+  assertNotAFlag,
   classifyFailure,
   clipDetail,
+  escapeIncludePattern,
+  estimatedRestoreBytes,
+  fileRestorePlan,
   isInconclusive,
+  isNotADirectory,
   isTransportOnly,
   lastMessageOfType,
   missingPaths,
@@ -834,7 +839,10 @@ Deno.test("a persistent EOF fails the retry too and is recorded as the failure i
 
 Deno.test("corruption is never retried", async () => {
   const fake = await fakeRestic(
-    failsOnceThen("pack 1a2b: ciphertext verification failed", `echo '${CLEAN_CHECK}'`),
+    failsOnceThen(
+      "pack 1a2b: ciphertext verification failed",
+      `echo '${CLEAN_CHECK}'`,
+    ),
   );
   const { context, written } = makeContext(
     globalsFor(fake.path, { transportRetryDelaySeconds: 0 }),
@@ -851,7 +859,8 @@ Deno.test("corruption is never retried", async () => {
 
 Deno.test("clipDetail keeps the END of stderr, where restic prints its verdict", () => {
   const retries = "retrying after 1s: unexpected EOF\n".repeat(200);
-  const clipped = clipDetail(retries + "Fatal: repository contains errors") ?? "";
+  const clipped = clipDetail(retries + "Fatal: repository contains errors") ??
+    "";
   assert(clipped.length <= 2000, `clipped to ${clipped.length}`);
   assert(clipped.startsWith("retrying after"));
   assert(clipped.endsWith("Fatal: repository contains errors"));
@@ -1158,6 +1167,327 @@ Deno.test("the restore ceiling is raisable PER RUN, not only permanently", async
   } finally {
     fake.cleanup();
   }
+});
+
+// ---------------------------------------------------------------------------
+// restore — a single-file path
+// ---------------------------------------------------------------------------
+
+Deno.test("fileRestorePlan restores the parent with an anchored include", () => {
+  assertEquals(fileRestorePlan("/srv/app/backups/counts.json"), {
+    parent: "/srv/app/backups",
+    include: "/counts.json",
+  });
+  assertEquals(fileRestorePlan("/rootfile"), {
+    parent: "/",
+    include: "/rootfile",
+  });
+  assertEquals(fileRestorePlan("/srv/app/counts.json/"), {
+    parent: "/srv/app",
+    include: "/counts.json",
+  });
+  assertEquals(fileRestorePlan("/"), null);
+  assertEquals(fileRestorePlan(""), null);
+});
+
+Deno.test("escapeIncludePattern makes glob metacharacters literal", () => {
+  assertEquals(escapeIncludePattern("we[ir]d*.json"), "we\\[ir\\]d\\*.json");
+  assertEquals(escapeIncludePattern("a?b\\c"), "a\\?b\\\\c");
+  assertEquals(escapeIncludePattern("plain.json"), "plain.json");
+});
+
+Deno.test("estimatedRestoreBytes: an omitted total_bytes is zero only when total_files says so", () => {
+  // restic omits zero-valued fields: an empty file's dry run is
+  // {"total_files":1,"files_restored":1} — measured on 0.19.1.
+  assertEquals(estimatedRestoreBytes({ total_files: 1 }), 0);
+  assertEquals(estimatedRestoreBytes({ total_bytes: 8, total_files: 1 }), 8);
+  // An include that matched nothing yields a bare summary: no measurement.
+  assertEquals(estimatedRestoreBytes({ message_type: "summary" }), null);
+  assertEquals(estimatedRestoreBytes(null), null);
+});
+
+Deno.test("isNotADirectory recognises restic's file-selector refusal", () => {
+  const live = '{"message_type":"exit_error","code":1,"message":' +
+    '"path srv/app/backups/counts.json: not a directory"}';
+  assert(isNotADirectory(result({ code: 1, stderr: live })));
+  assert(!isNotADirectory(result({ code: 1, stderr: "path nope: not found" })));
+  assert(!isNotADirectory(result({ code: 0, stderr: live })));
+});
+
+/**
+ * A fake restic that behaves like 0.19.1 for a FILE path: the file selector
+ * fails "not a directory", and the parent selector with --include measures
+ * and restores one file. Every invocation is appended to `log`.
+ */
+function singleFileScript(log: string, bytes: number): string {
+  const summary = `{"message_type":"summary","total_files":1,` +
+    `"files_restored":1,"total_bytes":${bytes},"bytes_restored":${bytes}}`;
+  return `echo "$@" >> ${log}\n` +
+    'case "$*" in\n' +
+    '  *":/srv/app/backups/counts.json "*)\n' +
+    '    echo \'{"message_type":"exit_error","code":1,"message":"path ' +
+    "srv/app/backups/counts.json: not a directory\"}' >&2; exit 1 ;;\n" +
+    '  *":/srv/app/backups "*"--include /counts.json"*)\n' +
+    `    printf '%s\\n' '${summary}' ;;\n` +
+    '  *) echo "unexpected: $*" >&2; exit 1 ;;\n' +
+    "esac";
+}
+
+Deno.test("a single-file path restores just that file, under the ceiling", async () => {
+  // LIVE-FOUND DEFECT (2026-10-20): restore path=…/counts.json failed
+  // "could not measure the size … not a directory", because restic accepts
+  // only a directory after <snapshot>:.
+  const log = await Deno.makeTempFile();
+  const fake = await fakeRestic(singleFileScript(log, 8));
+  const { context, written } = makeContext(globalsFor(fake.path));
+  try {
+    await methods.restore.execute(
+      { path: "/srv/app/backups/counts.json", target: "/tmp/drill" },
+      context,
+    );
+    const calls = (await Deno.readTextFile(log)).trim().split("\n");
+    // file dry run (refused) -> parent dry run -> real restore
+    assertEquals(calls.length, 3, calls.join("\n"));
+    assertStringIncludes(calls[1], "latest:/srv/app/backups ");
+    assertStringIncludes(calls[1], "--include /counts.json");
+    assertStringIncludes(calls[1], "--dry-run");
+    assertStringIncludes(calls[2], "latest:/srv/app/backups ");
+    assertStringIncludes(calls[2], "--include /counts.json");
+    assertStringIncludes(calls[2], "--verify");
+    assert(!calls[2].includes("--dry-run"), calls[2]);
+
+    assertEquals(written.length, 1);
+    assertEquals(written[0].data.passed, true);
+    assertEquals(written[0].data.restorePath, "/srv/app/backups/counts.json");
+    assertEquals(written[0].data.itemsRestored, 1);
+    assertEquals(written[0].data.estimatedBytes, 8);
+  } finally {
+    fake.cleanup();
+    Deno.removeSync(log);
+  }
+});
+
+Deno.test("a single-file restore keeps the fail-closed ceiling", async () => {
+  const log = await Deno.makeTempFile();
+  const fake = await fakeRestic(singleFileScript(log, 5_000_000_000));
+  const { context, written } = makeContext(globalsFor(fake.path));
+  try {
+    await assertRejects(
+      () =>
+        methods.restore.execute(
+          { path: "/srv/app/backups/counts.json", target: "/tmp/drill" },
+          context,
+        ),
+      Error,
+      "ceiling",
+    );
+    const calls = (await Deno.readTextFile(log)).trim().split("\n");
+    assert(
+      calls.every((c) => c.includes("--dry-run")),
+      `no real restore may run over the ceiling: ${calls.join("\n")}`,
+    );
+    assertEquals(written[0].data.failureReason, "exceeds-size-ceiling");
+    assertEquals(written[0].data.estimatedBytes, 5_000_000_000);
+  } finally {
+    fake.cleanup();
+    Deno.removeSync(log);
+  }
+});
+
+Deno.test("a single-file include that matches nothing is refused, not restored blind", async () => {
+  const fake = await fakeRestic(
+    'case "$*" in\n' +
+      '  *"--include"*"--dry-run"*) echo \'{"message_type":"summary"}\' ;;\n' +
+      '  *"--include"*) echo "REAL RESTORE SHOULD NOT RUN" >&2; exit 1 ;;\n' +
+      '  *) echo \'{"message_type":"exit_error","code":1,"message":"path ' +
+      "x: not a directory\"}' >&2; exit 1 ;;\n" +
+      "esac",
+  );
+  const { context, written } = makeContext(globalsFor(fake.path));
+  try {
+    await assertRejects(
+      () =>
+        methods.restore.execute(
+          { path: "/srv/app/counts.json", target: "/tmp/drill" },
+          context,
+        ),
+      Error,
+      "could not measure",
+    );
+    assertEquals(written[0].data.failureReason, "size-unmeasurable");
+    assertEquals(written[0].data.bytesRestored, null);
+  } finally {
+    fake.cleanup();
+  }
+});
+
+Deno.test("a single-file include matching more than one file is refused", async () => {
+  // Defence in depth: the include is anchored and escaped, so this should be
+  // impossible — but if it ever selected more than the one file asked for,
+  // the drill would be proving something other than what it reports.
+  const fake = await fakeRestic(
+    'case "$*" in\n' +
+      '  *"--include"*"--dry-run"*) echo \'{"message_type":"summary",' +
+      '"total_files":2,"files_restored":2,"total_bytes":16,' +
+      '"bytes_restored":16}\' ;;\n' +
+      '  *"--include"*) echo "REAL RESTORE SHOULD NOT RUN" >&2; exit 1 ;;\n' +
+      '  *) echo \'{"message_type":"exit_error","code":1,"message":"path ' +
+      "x: not a directory\"}' >&2; exit 1 ;;\n" +
+      "esac",
+  );
+  const { context, written } = makeContext(globalsFor(fake.path));
+  try {
+    await assertRejects(
+      () =>
+        methods.restore.execute(
+          { path: "/srv/app/counts.json", target: "/tmp/drill" },
+          context,
+        ),
+      Error,
+      "expected exactly 1",
+    );
+    assertEquals(written[0].data.failureReason, "file-match-mismatch");
+    assertEquals(written[0].data.bytesRestored, null);
+  } finally {
+    fake.cleanup();
+  }
+});
+
+Deno.test("a directory path never gains an --include", async () => {
+  const log = await Deno.makeTempFile();
+  const fake = await fakeRestic(
+    `echo "$@" >> ${log}\nprintf '%s\\n' '${RESTORE_OK}'`,
+  );
+  const { context } = makeContext(globalsFor(fake.path));
+  try {
+    await methods.restore.execute(
+      { path: "/etc", target: "/tmp/drill" },
+      context,
+    );
+    const argv = await Deno.readTextFile(log);
+    assert(!argv.includes("--include"), argv);
+    assertEquals(argv.trim().split("\n").length, 2);
+  } finally {
+    fake.cleanup();
+    Deno.removeSync(log);
+  }
+});
+
+Deno.test("a snapshot or dump path that restic would read as a flag is refused before restic runs", async () => {
+  assertNotAFlag("snapshot", "a1b2c3d4");
+  const log = await Deno.makeTempFile();
+  const fake = await fakeRestic(`echo "$@" >> ${log}`);
+  try {
+    for (
+      const call of [
+        () =>
+          methods.restore.execute(
+            {
+              path: "/etc",
+              target: "/tmp/drill",
+              snapshot: "--password-command=evil",
+            },
+            makeContext(globalsFor(fake.path)).context,
+          ),
+        () =>
+          methods.dump.execute(
+            { path: "--password-command=evil" },
+            makeContext(globalsFor(fake.path)).context,
+          ),
+      ]
+    ) {
+      await assertRejects(call, Error, "read as an option");
+    }
+    assertEquals(await Deno.readTextFile(log), "");
+  } finally {
+    fake.cleanup();
+    Deno.removeSync(log);
+  }
+});
+
+/** Is a real restic on PATH? The end-to-end test below needs one. */
+function hasRestic(): boolean {
+  try {
+    return new Deno.Command("restic", { args: ["version"] }).outputSync()
+      .success;
+  } catch {
+    return false;
+  }
+}
+
+Deno.test({
+  name: "end to end with a real restic: one file restored from a local repo",
+  ignore: !hasRestic(),
+  fn: async () => {
+    // A throwaway LOCAL repository: proves restic's own include semantics
+    // (anchoring, glob escaping, empty-file summaries) that the fakes assume.
+    const root = await Deno.makeTempDir({ prefix: "restic-e2e-" });
+    const src = `${root}/src`;
+    await Deno.mkdir(`${src}/data/backups/sub`, { recursive: true });
+    await Deno.writeTextFile(`${src}/data/backups/counts.json`, '{"n":1}\n');
+    await Deno.writeTextFile(`${src}/data/backups/sub/counts.json`, "decoy\n");
+    await Deno.writeTextFile(`${src}/data/backups/we[ir]d*.json`, "glob\n");
+    await Deno.writeTextFile(`${src}/data/backups/empty.json`, "");
+    const creds = {
+      repository: `${root}/repo`,
+      password: "e2e-only-password",
+      accessKeyId: "",
+      secretAccessKey: "",
+    };
+    const env = {
+      PATH: Deno.env.get("PATH") ?? "/usr/bin:/bin",
+      RESTIC_REPOSITORY: creds.repository,
+      RESTIC_PASSWORD: creds.password,
+      RESTIC_CACHE_DIR: `${root}/cache`,
+    };
+    for (const args of [["init"], ["backup", "data"]]) {
+      const out = await new Deno.Command("restic", {
+        args,
+        env,
+        clearEnv: true,
+        cwd: src,
+        stdout: "null",
+        stderr: "piped",
+      }).output();
+      assert(out.success, new TextDecoder().decode(out.stderr));
+    }
+    // `backup data` from cwd=src stores the tree rooted at /data, while the
+    // snapshot's `paths` records the absolute source path — so the selector
+    // path is /data/…, which is exactly what restic ls prints.
+    const base = "/data";
+    const g = {
+      repository: creds.repository,
+      password: creds.password,
+      accessKeyId: "e2e",
+      secretAccessKey: "e2e-unused-secret",
+      cacheDir: `${root}/cache`,
+    };
+    try {
+      for (
+        const [file, expected] of [
+          ["counts.json", '{"n":1}\n'],
+          ["we[ir]d*.json", "glob\n"],
+          ["empty.json", ""],
+        ]
+      ) {
+        const target = `${root}/t-${file.replace(/[^a-z]/g, "")}`;
+        const { context, written } = makeContext(g);
+        await methods.restore.execute(
+          { path: `${base}/backups/${file}`, target },
+          context,
+        );
+        assertEquals(written[0].data.passed, true);
+        assertEquals(written[0].data.itemsRestored, 1);
+        const restored: string[] = [];
+        for await (const e of Deno.readDir(target)) restored.push(e.name);
+        // Only the file: the anchored include must not pull sub/counts.json.
+        assertEquals(restored, [file]);
+        assertEquals(await Deno.readTextFile(`${target}/${file}`), expected);
+      }
+    } finally {
+      Deno.removeSync(root, { recursive: true });
+    }
+  },
 });
 
 // ---------------------------------------------------------------------------

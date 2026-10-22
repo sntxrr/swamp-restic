@@ -111,6 +111,10 @@ export async function runRestic(
   const started = Date.now();
 
   try {
+    // Reviewed (#436): the one subprocess in this model. Credentials go via
+    // `env` only (checked above: a secret in argv throws), clearEnv keeps the
+    // parent environment out, there is no shell, and stderr is redacted.
+    // swamp-quality-ignore deno-command
     const command = new Deno.Command(options.binary ?? "restic", {
       args: argv,
       env,
@@ -387,6 +391,60 @@ export function ageHours(iso: string | null, now: number): number | null {
   return Math.max(0, (now - then) / 3_600_000);
 }
 
+/**
+ * Did a `<snapshot>:<path>` restore fail because `<path>` is a file?
+ *
+ * restic accepts only a directory after the colon. A file fails with
+ * `{"message_type":"exit_error",…,"message":"path <p>: not a directory"}` on
+ * stderr — measured on restic 0.19.1, and live on 2026-10-20 against a
+ * `counts.json`. Both streams are searched so an older binary that prints
+ * plain text to stdout is still recognised.
+ */
+export function isNotADirectory(result: ResticResult): boolean {
+  return result.code !== RESTIC_EXIT.OK &&
+    /: not a directory/i.test(`${result.stderr}\n${result.stdout}`);
+}
+
+/** Escape restic's include-pattern metacharacters so a name matches literally. */
+export function escapeIncludePattern(name: string): string {
+  return name.replace(/[\\*?[\]]/g, (c) => `\\${c}`);
+}
+
+/**
+ * How to restore ONE file: its parent directory as the selector, narrowed by
+ * an anchored `--include` of the file's name.
+ *
+ * The include is relative to the selected subfolder, and the leading `/`
+ * anchors it, so `/counts.json` never also matches `sub/counts.json`. Returns
+ * null for a path with no file name in it (`/`, empty).
+ */
+export function fileRestorePlan(
+  path: string,
+): { parent: string; include: string } | null {
+  const trimmed = path.replace(/\/+$/, "");
+  const cut = trimmed.lastIndexOf("/");
+  const base = trimmed.slice(cut + 1);
+  if (base.length === 0 || base === "." || base === "..") return null;
+  const parent = cut <= 0 ? "/" : trimmed.slice(0, cut);
+  return { parent, include: `/${escapeIncludePattern(base)}` };
+}
+
+/**
+ * Bytes a dry-run restore would write, or null when it measured nothing.
+ *
+ * restic omits zero-valued summary fields, so an empty file's dry run reports
+ * `total_files` with no `total_bytes` — a measured zero. A summary with
+ * neither (an include that matched nothing) is no measurement, and stays null
+ * so the ceiling fails closed.
+ */
+export function estimatedRestoreBytes(
+  summary: Record<string, unknown> | null,
+): number | null {
+  if (typeof summary?.total_bytes === "number") return summary.total_bytes;
+  if (typeof summary?.total_files === "number") return 0;
+  return null;
+}
+
 // ---------------------------------------------------------------------------
 // Platform types
 // ---------------------------------------------------------------------------
@@ -651,7 +709,8 @@ const DumpArgsSchema = z.object({
 
 const RestoreArgsSchema = z.object({
   path: z.string().describe(
-    "Subtree inside the snapshot to restore, e.g. /etc.",
+    "Subtree or single file inside the snapshot to restore, e.g. /etc or " +
+      "/etc/hostname. A file is restored as <target>/<file name>.",
   ),
   target: z.string().describe(
     "Local directory to restore into. Contents are overwritten.",
@@ -743,6 +802,24 @@ async function writeValidation(
   );
 }
 
+/**
+ * Refuse a method input that restic would parse as a flag.
+ *
+ * Inputs reach restic as separate argv elements, never through a shell, so
+ * there is no shell injection — but a snapshot of `--password-command=…` in a
+ * positional slot would be read as an option. Every other input is either
+ * prefixed (`<snapshot>:<path>`, `--include /…`) or is the value of a flag
+ * (`--target <dir>`), so only the bare positional ones need this.
+ */
+export function assertNotAFlag(field: string, value: string): void {
+  if (value.startsWith("-")) {
+    throw new Error(
+      `${field} "${value}" begins with "-", which restic would read as an ` +
+        `option. Pass a snapshot ID or an absolute path.`,
+    );
+  }
+}
+
 type SnapshotChoice =
   | { snapshot: string }
   | { failureReason: string; detail: string | null; exitCode: number };
@@ -758,7 +835,10 @@ async function chooseSnapshot(
   g: GlobalArgs,
   explicit: string | undefined,
 ): Promise<SnapshotChoice> {
-  if (explicit !== undefined) return { snapshot: explicit };
+  if (explicit !== undefined) {
+    assertNotAFlag("snapshot", explicit);
+    return { snapshot: explicit };
+  }
   const excluded = new Set(g.excludeTags ?? []);
   if (excluded.size === 0) return { snapshot: "latest" };
 
@@ -918,8 +998,22 @@ async function runCheck(
 
 export const model = {
   type: "@sntxrr/restic/repository",
-  version: "2026.08.07.2",
+  version: "2026.10.22.1",
   globalArguments: GlobalArgsSchema,
+
+  // Every globalArguments change so far only ADDED optional fields, so
+  // existing arguments are already valid and each step is a no-op. Each still
+  // has to exist: it is what advances an instance's typeVersion, and a
+  // version with no entry strands every existing instance.
+  upgrades: [
+    {
+      toVersion: "2026.10.22.1",
+      description: "No migration: only optional globalArguments were added " +
+        "since 2026.08.07 (excludeTags, transportRetryDelaySeconds). " +
+        "restore now accepts a single-file path.",
+      upgradeAttributes: (old: Record<string, unknown>) => old,
+    },
+  ],
 
   resources: {
     "repository": {
@@ -1299,6 +1393,7 @@ export const model = {
         const g = context.globalArgs;
         const name = repositoryName(g.repository);
         const ranAt = new Date().toISOString();
+        assertNotAFlag("path", args.path);
         const choice = await chooseSnapshot(g, args.snapshot);
         if (!("snapshot" in choice)) {
           return await failUnchosen(context, "dump", ranAt, choice);
@@ -1362,8 +1457,11 @@ export const model = {
     // -----------------------------------------------------------------------
     "restore": {
       description:
-        "Rung 5. Restore a scoped subtree to a local target and verify it — " +
-        "the only rung that actually proves the backup is restorable. The " +
+        "Rung 5. Restore a scoped subtree, or a single file, to a local " +
+        "target and verify it — the only rung that actually proves the " +
+        "backup is restorable. A file is restored as its parent directory " +
+        "narrowed by an anchored --include, so it lands at " +
+        "<target>/<file name>. The " +
         "size ceiling is measured with a dry-run restore and " +
         "enforced BEFORE any data moves, so a refused drill costs nothing. " +
         "Raise it per run rather than permanently.",
@@ -1382,7 +1480,10 @@ export const model = {
           return await failUnchosen(context, "restore", ranAt, choice);
         }
         const snapshot = choice.snapshot;
-        const selector = `${snapshot}:${args.path}`;
+        let selector = `${snapshot}:${args.path}`;
+        // Set when args.path turns out to be a file: restore its parent,
+        // narrowed to it by an anchored --include.
+        let include: string | null = null;
         // The ceiling is a method input OR a global argument, resolved here in
         // execute. It is deliberately NOT a pre-flight check: checks never
         // receive method inputs, so a check would reject the per-run override
@@ -1401,29 +1502,53 @@ export const model = {
         //
         // A dry run walks the same code path as the restore itself, honours
         // the selector, and writes nothing. It needs restic 0.17.0+.
-        const dryRun = await runRestic(
+        const restoreArgs = (): string[] => [
+          "restore",
+          selector,
+          "--target",
+          args.target,
+          ...(include === null ? [] : ["--include", include]),
+        ];
+        let dryRun = await runRestic(
           creds,
-          [
-            "restore",
-            selector,
-            "--target",
-            args.target,
-            "--dry-run",
-            "--json",
-          ],
+          [...restoreArgs(), "--dry-run", "--json"],
           opts,
         );
+        // A file after the colon fails with "not a directory" (live,
+        // 2026-10-20). Measure the parent narrowed to the file instead, so a
+        // single file goes through the SAME dry-run ceiling as a subtree.
+        const plan = isNotADirectory(dryRun)
+          ? fileRestorePlan(args.path)
+          : null;
+        if (plan !== null) {
+          selector = `${snapshot}:${plan.parent}`;
+          include = plan.include;
+          context.logger.info(
+            `${name}: ${args.path} is a file; restoring ${plan.parent} ` +
+              `with --include ${plan.include}`,
+          );
+          dryRun = await runRestic(
+            creds,
+            [...restoreArgs(), "--dry-run", "--json"],
+            opts,
+          );
+        }
         const drySummary = lastMessageOfType(
           parseJsonLines(dryRun.stdout),
           "summary",
         );
-        const estimated = typeof drySummary?.total_bytes === "number"
-          ? drySummary.total_bytes
-          : null;
+        const estimated = estimatedRestoreBytes(drySummary);
 
         // FAIL CLOSED. An unmeasurable size must never read as a safe size —
-        // that is exactly how the previous guard let everything through.
-        if (estimated === null || estimated > ceiling) {
+        // that is exactly how the previous guard let everything through. In
+        // file mode the dry run must also have matched exactly one file:
+        // anything else means the include did not select what was asked for.
+        const fileCount = typeof drySummary?.total_files === "number"
+          ? drySummary.total_files
+          : 0;
+        const wrongMatch = include !== null && estimated !== null &&
+          fileCount !== 1;
+        if (estimated === null || estimated > ceiling || wrongMatch) {
           const unmeasurable = estimated === null;
           await writeValidation(context, {
             repositoryName: name,
@@ -1432,10 +1557,14 @@ export const model = {
             inconclusive: true,
             failureReason: unmeasurable
               ? "size-unmeasurable"
+              : wrongMatch
+              ? "file-match-mismatch"
               : "exceeds-size-ceiling",
             detail: unmeasurable
               ? `dry run produced no summary; refusing to restore blind: ` +
                 `${dryRun.stderr.slice(0, 500)}`
+              : wrongMatch
+              ? `--include ${include} matched ${fileCount} files, expected 1`
               : `${estimated} bytes exceeds ceiling ${ceiling}`,
             exitCode: dryRun.code,
             ranAt,
@@ -1450,6 +1579,9 @@ export const model = {
               ? `could not measure the size of ${selector} — a dry run ` +
                 `produced no summary, so the ceiling cannot be enforced and ` +
                 `the restore is refused: ${dryRun.stderr.slice(0, 300)}`
+              : wrongMatch
+              ? `restore of ${args.path} refused: --include ${include} ` +
+                `matched ${fileCount} files in ${selector}, expected exactly 1`
               : `restore of ${selector} would write ${estimated} bytes, over ` +
                 `the ${ceiling}-byte ceiling. Raise it for this run with ` +
                 `--input maxRestoreBytes=<n>, not permanently on the model.`,
@@ -1458,7 +1590,7 @@ export const model = {
 
         const run = await runRestic(
           creds,
-          ["restore", selector, "--target", args.target, "--verify", "--json"],
+          [...restoreArgs(), "--verify", "--json"],
           opts,
         );
 
